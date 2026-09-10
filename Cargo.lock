@@ -322,8 +322,10 @@ dependencies = [
  "fontdue",
  "imara-diff",
  "libc",
+ "memchr",
  "memmap2",
  "pollster",
+ "unicode-width",
  "wgpu",
  "winit",
 ]

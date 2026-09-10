@@ -1,3 +1,7 @@
+mod diff;
+mod text;
+mod trace;
+
 fn main() {
-    println!("Hello, world!");
+    trace::init();
 }
