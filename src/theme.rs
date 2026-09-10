@@ -1,0 +1,109 @@
+//! Color palettes. Colors are packed RGBA8 (little-endian: r in the low byte) so they can
+//! be handed to the GPU untouched.
+
+pub type Color = u32;
+
+pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
+    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((a as u32) << 24)
+}
+
+pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
+    rgba(r, g, b, 255)
+}
+
+pub fn to_f64(c: Color) -> [f64; 4] {
+    [
+        (c & 0xff) as f64 / 255.0,
+        ((c >> 8) & 0xff) as f64 / 255.0,
+        ((c >> 16) & 0xff) as f64 / 255.0,
+        ((c >> 24) & 0xff) as f64 / 255.0,
+    ]
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Theme {
+    pub bg: Color,
+    pub fg: Color,
+    pub gutter_bg: Color,
+    pub gutter_fg: Color,
+    pub gutter_fg_cursor: Color,
+    pub divider: Color,
+    pub filler_bg: Color,
+    pub del_bg: Color,
+    pub del_strong: Color,
+    pub add_bg: Color,
+    pub add_strong: Color,
+    pub ws_bg: Color,
+    pub ws_strong: Color,
+    pub ws_marker: Color,
+    pub ws_hidden_marker: Color,
+    pub cursor_row: Color,
+    pub status_bg: Color,
+    pub status_fg: Color,
+    pub status_accent: Color,
+    pub status_dim: Color,
+    pub hunk_marker: Color,
+    pub scrollbar: Color,
+    pub scrollbar_del: Color,
+    pub scrollbar_add: Color,
+    pub error_fg: Color,
+    pub search_bg: Color,
+}
+
+pub const DARK: Theme = Theme {
+    bg: rgb(0x1a, 0x1c, 0x22),
+    fg: rgb(0xd4, 0xd8, 0xe0),
+    gutter_bg: rgb(0x16, 0x18, 0x1d),
+    gutter_fg: rgb(0x5a, 0x60, 0x6e),
+    gutter_fg_cursor: rgb(0xc8, 0xcc, 0xd6),
+    divider: rgb(0x2c, 0x30, 0x3a),
+    filler_bg: rgba(0x2a, 0x2d, 0x36, 0xa0),
+    del_bg: rgba(0xf2, 0x5c, 0x6c, 0x2e),
+    del_strong: rgba(0xf2, 0x5c, 0x6c, 0x70),
+    add_bg: rgba(0x4e, 0xd2, 0x90, 0x28),
+    add_strong: rgba(0x4e, 0xd2, 0x90, 0x66),
+    ws_bg: rgba(0x6f, 0x9c, 0xf5, 0x22),
+    ws_strong: rgba(0x6f, 0x9c, 0xf5, 0x58),
+    ws_marker: rgb(0x7f, 0x9c, 0xe0),
+    ws_hidden_marker: rgb(0x4a, 0x5a, 0x80),
+    cursor_row: rgba(0xff, 0xff, 0xff, 0x12),
+    status_bg: rgb(0x23, 0x26, 0x2e),
+    status_fg: rgb(0xb8, 0xbe, 0xca),
+    status_accent: rgb(0x8a, 0xb4, 0xf8),
+    status_dim: rgb(0x6c, 0x72, 0x80),
+    hunk_marker: rgb(0x8a, 0xb4, 0xf8),
+    scrollbar: rgba(0xff, 0xff, 0xff, 0x30),
+    scrollbar_del: rgb(0xd8, 0x5a, 0x66),
+    scrollbar_add: rgb(0x4a, 0xb8, 0x80),
+    error_fg: rgb(0xf2, 0x7a, 0x7a),
+    search_bg: rgba(0xf0, 0xc0, 0x40, 0x60),
+};
+
+pub const LIGHT: Theme = Theme {
+    bg: rgb(0xfb, 0xfb, 0xfc),
+    fg: rgb(0x24, 0x28, 0x30),
+    gutter_bg: rgb(0xf1, 0xf2, 0xf5),
+    gutter_fg: rgb(0xa0, 0xa6, 0xb2),
+    gutter_fg_cursor: rgb(0x30, 0x34, 0x40),
+    divider: rgb(0xdc, 0xdf, 0xe6),
+    filler_bg: rgba(0xe6, 0xe8, 0xee, 0xc0),
+    del_bg: rgba(0xf0, 0x40, 0x50, 0x24),
+    del_strong: rgba(0xf0, 0x40, 0x50, 0x60),
+    add_bg: rgba(0x20, 0xb0, 0x60, 0x22),
+    add_strong: rgba(0x20, 0xb0, 0x60, 0x5c),
+    ws_bg: rgba(0x40, 0x80, 0xf0, 0x1e),
+    ws_strong: rgba(0x40, 0x80, 0xf0, 0x50),
+    ws_marker: rgb(0x60, 0x80, 0xc8),
+    ws_hidden_marker: rgb(0xb0, 0xbc, 0xd8),
+    cursor_row: rgba(0x00, 0x00, 0x40, 0x0e),
+    status_bg: rgb(0xe8, 0xea, 0xef),
+    status_fg: rgb(0x3a, 0x40, 0x4c),
+    status_accent: rgb(0x2a, 0x60, 0xd0),
+    status_dim: rgb(0x8a, 0x90, 0x9c),
+    hunk_marker: rgb(0x2a, 0x60, 0xd0),
+    scrollbar: rgba(0x00, 0x00, 0x00, 0x28),
+    scrollbar_del: rgb(0xe0, 0x50, 0x60),
+    scrollbar_add: rgb(0x30, 0xa8, 0x70),
+    error_fg: rgb(0xc0, 0x30, 0x30),
+    search_bg: rgba(0xf0, 0xb0, 0x20, 0x60),
+};

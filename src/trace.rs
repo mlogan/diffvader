@@ -135,12 +135,6 @@ pub fn span_arg(name: &'static str, arg: u64) -> Span {
     }
 }
 
-impl Span {
-    pub fn elapsed(&self) -> Duration {
-        self.start.elapsed()
-    }
-}
-
 impl Drop for Span {
     fn drop(&mut self) {
         let dur = self.start.elapsed();

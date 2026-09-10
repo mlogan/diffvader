@@ -1,7 +1,7 @@
 //! File loading and line indexing.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::trace;
 
@@ -22,9 +22,6 @@ impl std::ops::Deref for Bytes {
 
 /// One side of the diff: the raw bytes plus an index of line start offsets.
 pub struct FileData {
-    pub path: PathBuf,
-    /// Display name (repo-relative path when launched by git, else the path given).
-    pub title: String,
     pub bytes: Bytes,
     /// `starts[i]` is the byte offset of line `i`; a final sentinel equals `bytes.len()`.
     /// Files larger than 4 GiB are rejected at load so `u32` offsets are exact.
@@ -37,7 +34,7 @@ pub struct FileData {
 const MMAP_THRESHOLD: u64 = 1 << 20;
 
 impl FileData {
-    pub fn load(path: &Path, title: String) -> io::Result<FileData> {
+    pub fn load(path: &Path) -> io::Result<FileData> {
         let _s = trace::span("file-load");
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
@@ -59,10 +56,10 @@ impl FileData {
             io::Read::read_to_end(&mut &file, &mut v)?;
             Bytes::Owned(v)
         };
-        Ok(Self::from_bytes(path.to_path_buf(), title, bytes))
+        Ok(Self::from_bytes(bytes))
     }
 
-    pub fn from_bytes(path: PathBuf, title: String, bytes: Bytes) -> FileData {
+    pub fn from_bytes(bytes: Bytes) -> FileData {
         let _s = trace::span_arg("line-index", bytes.len() as u64);
         let binary = bytes[..bytes.len().min(8192)].contains(&0);
         let mut starts = Vec::with_capacity(bytes.len() / 32 + 2);
@@ -77,16 +74,14 @@ impl FileData {
         }
         starts.push(bytes.len() as u32);
         FileData {
-            path,
-            title,
             bytes,
             starts,
             binary,
         }
     }
 
-    pub fn empty(path: PathBuf, title: String) -> FileData {
-        Self::from_bytes(path, title, Bytes::Owned(Vec::new()))
+    pub fn empty() -> FileData {
+        Self::from_bytes(Bytes::Owned(Vec::new()))
     }
 
     pub fn line_count(&self) -> usize {
@@ -114,11 +109,7 @@ mod tests {
     use super::*;
 
     fn fd(s: &str) -> FileData {
-        FileData::from_bytes(
-            PathBuf::new(),
-            String::new(),
-            Bytes::Owned(s.as_bytes().to_vec()),
-        )
+        FileData::from_bytes(Bytes::Owned(s.as_bytes().to_vec()))
     }
 
     #[test]

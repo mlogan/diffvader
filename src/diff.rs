@@ -345,14 +345,9 @@ fn push_range(out: &mut Vec<Range<u32>>, tokens: &[Range<u32>], r: Range<u32>) {
 mod tests {
     use super::*;
     use crate::text::Bytes;
-    use std::path::PathBuf;
 
     fn fd(s: &str) -> FileData {
-        FileData::from_bytes(
-            PathBuf::new(),
-            String::new(),
-            Bytes::Owned(s.as_bytes().to_vec()),
-        )
+        FileData::from_bytes(Bytes::Owned(s.as_bytes().to_vec()))
     }
 
     fn kinds(d: &DiffResult) -> Vec<RowKind> {
