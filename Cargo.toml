@@ -1,0 +1,29 @@
+[package]
+name = "diffvader"
+version = "0.1.0"
+edition = "2021"
+description = "Fast graphical side-by-side diff viewer for macOS, usable as a git difftool"
+license = "MIT"
+
+[dependencies]
+wgpu = { version = "30", default-features = false, features = ["metal", "wgsl"] }
+winit = "0.30"
+imara-diff = "0.2"
+fontdue = "0.9"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+libc = "0.2"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
