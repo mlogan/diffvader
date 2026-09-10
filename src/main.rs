@@ -52,6 +52,18 @@ fn main() {
         }
     };
 
+    // Font parsing and Metal device creation need no window; overlap them with AppKit init.
+    let font_path = opts.font.clone();
+    let font_pt = opts.font_pt;
+    let font_thread = std::thread::Builder::new()
+        .name("font".into())
+        .spawn(move || font::FontSet::load(font_path.as_deref(), font_pt * 2.0))
+        .expect("spawn font thread");
+    let gpu_thread = std::thread::Builder::new()
+        .name("gpu".into())
+        .spawn(gpu::GpuCore::init)
+        .expect("spawn gpu thread");
+
     let (tx, rx) = mpsc::channel::<Msg>();
     // The loader starts before the event loop exists; it gets the proxy (to wake the loop)
     // through this side channel once the loop has been created.
@@ -101,7 +113,7 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let _ = proxy_tx.send(proxy.clone());
 
-    let mut app = match App::new(opts, rx, tx, proxy) {
+    let mut app = match App::new(opts, rx, tx, proxy, font_thread, gpu_thread) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("diffvader: {e}");

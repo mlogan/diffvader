@@ -145,9 +145,18 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 }
 "#;
 
-impl Gpu {
-    pub fn new(window: Arc<Window>, atlas: &Atlas) -> Result<Gpu, String> {
-        let _s = trace::span("gpu-init");
+/// Instance, adapter and device: everything that does not need a window. Created on a
+/// background thread at process start so it overlaps AppKit initialization.
+pub struct GpuCore {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+impl GpuCore {
+    pub fn init() -> Result<GpuCore, String> {
+        let _s = trace::span("gpu-core-init");
         let instance = {
             let _s = trace::span("gpu-instance");
             wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -155,18 +164,11 @@ impl Gpu {
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             })
         };
-        let size = window.inner_size();
-        let surface = {
-            let _s = trace::span("gpu-surface");
-            instance
-                .create_surface(window)
-                .map_err(|e| format!("create_surface: {e}"))?
-        };
         let adapter = {
             let _s = trace::span("gpu-adapter");
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: Some(&surface),
+                compatible_surface: None,
                 ..Default::default()
             }))
             .map_err(|e| format!("request_adapter: {e}"))?
@@ -178,6 +180,31 @@ impl Gpu {
                 ..Default::default()
             }))
             .map_err(|e| format!("request_device: {e}"))?
+        };
+        Ok(GpuCore {
+            instance,
+            adapter,
+            device,
+            queue,
+        })
+    }
+}
+
+impl Gpu {
+    pub fn new(core: GpuCore, window: Arc<Window>, atlas: &Atlas) -> Result<Gpu, String> {
+        let _s = trace::span("gpu-init");
+        let GpuCore {
+            instance,
+            adapter,
+            device,
+            queue,
+        } = core;
+        let size = window.inner_size();
+        let surface = {
+            let _s = trace::span("gpu-surface");
+            instance
+                .create_surface(window)
+                .map_err(|e| format!("create_surface: {e}"))?
         };
 
         let caps = surface.get_capabilities(&adapter);

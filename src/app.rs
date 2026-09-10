@@ -15,7 +15,7 @@ use winit::window::{Window, WindowId};
 
 use crate::diff::{self, DiffResult, IntraDiff, Row, RowKind, WhitespaceMode, NONE};
 use crate::font::{Atlas, FontSet};
-use crate::gpu::{DrawList, Gpu, SurfaceProblem};
+use crate::gpu::{DrawList, Gpu, GpuCore, SurfaceProblem};
 use crate::keys::{Action, KeyInput, Vi};
 use crate::text::FileData;
 use crate::theme::{self, Theme};
@@ -65,6 +65,7 @@ pub struct App {
     tx: mpsc::Sender<Msg>,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
+    gpu_core: Option<std::thread::JoinHandle<Result<GpuCore, String>>>,
     fonts: FontSet,
     atlas: Atlas,
     scale: f64,
@@ -117,8 +118,15 @@ impl App {
         rx: mpsc::Receiver<Msg>,
         tx: mpsc::Sender<Msg>,
         proxy: EventLoopProxy<()>,
+        fonts: std::thread::JoinHandle<Result<FontSet, String>>,
+        gpu_core: std::thread::JoinHandle<Result<GpuCore, String>>,
     ) -> Result<App, String> {
-        let fonts = FontSet::load(opts.font.as_deref(), opts.font_pt * 2.0)?;
+        let fonts = {
+            let _s = trace::span("font-join");
+            fonts
+                .join()
+                .map_err(|_| "font thread panicked".to_string())??
+        };
         let atlas = Atlas::new(opts.font_pt * 2.0, 1.0, 1.0, 1.0);
         let dark = !opts.light;
         Ok(App {
@@ -132,6 +140,7 @@ impl App {
             proxy,
             window: None,
             gpu: None,
+            gpu_core: Some(gpu_core),
             fonts,
             atlas,
             scale: 2.0,
@@ -1415,7 +1424,15 @@ impl ApplicationHandler<()> for App {
         drop(_s);
         self.scale = window.scale_factor();
         self.rebuild_font();
-        match Gpu::new(window.clone(), &self.atlas) {
+        let core = {
+            let _s = trace::span("gpu-core-join");
+            self.gpu_core
+                .take()
+                .expect("gpu core handle")
+                .join()
+                .unwrap_or_else(|_| Err("gpu thread panicked".into()))
+        };
+        match core.and_then(|c| Gpu::new(c, window.clone(), &self.atlas)) {
             Ok(g) => self.gpu = Some(g),
             Err(e) => {
                 eprintln!("diffvader: GPU init failed: {e}");
@@ -1426,6 +1443,12 @@ impl ApplicationHandler<()> for App {
         trace::mark("window-ready");
         self.window = Some(window.clone());
         self.drain_messages();
+        // Draw now rather than waiting for AppKit's first redraw request; the request is
+        // still made so a frame lands after the window is fully on screen.
+        self.render();
+        if self.want_exit {
+            el.exit();
+        }
         window.request_redraw();
     }
 
