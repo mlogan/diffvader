@@ -27,7 +27,7 @@ diffvader a.rs b.rs    # two files, or two directory trees
 ```
 
 `j`/`k` step between changes, `⌘P` fuzzy-opens another file, `⌘↓`/`⌘↑` browse files,
-`w` cycles whitespace modes, `?` shows every key, `q` quits.
+`w` cycles whitespace modes, `?` shows the key reference (any key closes it), `q` quits.
 
 `git difftool` is supported too and opens a single window for all files, but git itself
 spends ~65 ms per file preparing temp files and shell helpers before the viewer sees them.

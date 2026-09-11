@@ -74,7 +74,7 @@ handy when git launches the tool.
 | `w` or `:ws exact\|eol\|change\|all` | cycle / set whitespace mode (re-diffs in the background) |
 | `+` `-` `⌘=` `⌘-` `⌘0` | zoom |
 | `t` | toggle light / dark theme |
-| `?` | help overlay |
+| `?` | key reference overlay (any key or click closes it) |
 | `q` `ZZ` `:q` `⌘Q` `⌘W` | quit |
 
 Mouse: wheel and trackpad scroll, click a row to put the cursor there, click or drag the

@@ -2160,7 +2160,7 @@ const HELP_LINES: &[&str] = &[
     "  /pat  n  N           search (smart case)",
     "  w  or  :ws <mode>    cycle whitespace: exact, eol, change, all",
     "  + / -  (⌘= / ⌘-)     zoom      t  toggle light/dark",
-    "  q  ZZ  :q            quit      ?  toggle this help",
+    "  q  ZZ  :q            quit      ?  show this help (any key closes it)",
 ];
 
 // ---- winit glue ---------------------------------------------------------------------------
@@ -2291,7 +2291,10 @@ impl ApplicationHandler<()> for App {
                     Key::Named(NamedKey::ArrowUp) => Some(-1),
                     _ => None,
                 };
-                if let (true, Some(d)) = (cmd, arrow) {
+                if self.help {
+                    // The help overlay is modal: any key dismisses it and is consumed.
+                    self.help = false;
+                } else if let (true, Some(d)) = (cmd, arrow) {
                     self.browse_files(d);
                 } else if self.picker.is_some() {
                     self.picker_key(&event.logical_key, ctrl, cmd);
@@ -2328,7 +2331,9 @@ impl ApplicationHandler<()> for App {
                 }
                 match state {
                     ElementState::Pressed => {
-                        if self.picker.is_some() {
+                        if self.help {
+                            self.help = false;
+                        } else if self.picker.is_some() {
                             self.picker = None;
                         } else {
                             self.mouse_down();
