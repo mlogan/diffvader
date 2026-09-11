@@ -139,6 +139,16 @@ Progress:
       `--git` take every following argument, so put options before them.
 - [ ] not tested: codex and gemini command lines (neither is installed here)
 
+Follow-ups the same day:
+- `i` review comments (`src/comments.rs`): stored next to notes, `#` in the right gutter,
+  shown in the panel. Quit with comments pending shows one prompt (each change as a
+  unified diff plus the comment); `Y` copies via `pbcopy` and quits, `Q` quits without
+  copying; the prompt is always written to `$TMPDIR/diffvader-comments-*.md` and the path
+  printed on exit. Tested headless with `DIFFVADER_KEYS=$'itext\nqY'`.
+- Config file (`src/config.rs`): `~/.config/diffvader/config`, `key = value`, no TOML
+  dependency. Fonts may be family names: `font::resolve` scans the font directories (~2 ms
+  on the font thread, only when a name is configured). `--init-config` writes a template.
+
 ## Remaining / ideas
 
 - Borderless window with custom title bar (~22 ms faster cold start; not needed for the 200 ms target)

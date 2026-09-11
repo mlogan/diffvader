@@ -46,6 +46,8 @@ its diff, as one prompt to paste into an agent.
 spends ~65 ms per file preparing temp files and shell helpers before the viewer sees them.
 `git dv` and `git dvs` read straight from git and are the fast path.
 
+`diffvader --init-config` writes a settings file (font, size, theme, tab width, agent).
+
 Full options, keys, colors and performance notes: [docs/USAGE.md](docs/USAGE.md).
 Architecture and status: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 

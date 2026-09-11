@@ -1,5 +1,6 @@
 mod app;
 mod comments;
+mod config;
 mod diff;
 mod difftool;
 mod explain;
@@ -38,7 +39,7 @@ options:
   -w, --ignore-all-space       ignore all whitespace
   -b, --ignore-space-change    ignore changes in the amount of whitespace
       --ignore-space-at-eol    ignore whitespace at end of line
-      --font PATH              monospace font file (default: SF Mono / Menlo)
+      --font PATH|NAME         monospace font file or family name (default: SF Mono / Menlo)
       --font-size PT           font size in points (default 13)
       --tab-width N            tab stop width (default 4)
       --light                  light color theme
@@ -49,6 +50,8 @@ options:
       --screenshot FILE.bmp    render the first diff frame to a BMP file and exit
       --quit-after-first-frame exit as soon as the diff is on screen (for benchmarking)
       --bench-scroll N         scroll through the diff in N frames, print stats, exit
+      --config FILE            settings file (default: ~/.config/diffvader/config)
+      --init-config            write a commented settings template there and exit
       --git-config             print the git config needed to use diffvader as a difftool
       --install-git            write that config to ~/.gitconfig, including a `git dv` alias
   -h, --help                   show this help
@@ -279,14 +282,40 @@ fn load_pair(
 }
 
 fn parse_args() -> Result<Options, String> {
-    let mut args = std::env::args().skip(1);
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    // The config file supplies defaults, so it is read before the flags are parsed.
+    let config_path = all
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|i| all.get(i + 1))
+        .map(PathBuf::from)
+        .unwrap_or_else(config::path);
+    if all.iter().any(|a| a == "--init-config") {
+        match config::init(&config_path) {
+            Ok(true) => println!("wrote {}", config_path.display()),
+            Ok(false) => println!("{} already exists", config_path.display()),
+            Err(e) => {
+                eprintln!("diffvader: {e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+    let cfg = match config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("diffvader: ignoring config: {e}");
+            config::Config::default()
+        }
+    };
+    let mut args = all.into_iter();
     let mut paths: Vec<PathBuf> = Vec::new();
-    let mut font = None;
-    let mut font_pt = 13.0f32;
-    let mut tab_width = 4u32;
-    let mut whitespace = WhitespaceMode::Exact;
-    let mut light = false;
-    let mut agent = std::env::var("DIFFVADER_AGENT").ok();
+    let mut font = cfg.font;
+    let mut font_pt = cfg.font_pt.unwrap_or(13.0);
+    let mut tab_width = cfg.tab_width.unwrap_or(4).clamp(1, 16);
+    let mut whitespace = cfg.whitespace.unwrap_or(WhitespaceMode::Exact);
+    let mut light = cfg.light.unwrap_or(false);
+    let mut agent = std::env::var("DIFFVADER_AGENT").ok().or(cfg.agent);
     let mut timing = std::env::var_os("DIFFVADER_TIMING").is_some();
     let mut trace_path = std::env::var("DIFFVADER_TRACE").ok();
     let mut screenshot = None;
@@ -352,7 +381,10 @@ fn parse_args() -> Result<Options, String> {
             "-w" | "--ignore-all-space" => whitespace = WhitespaceMode::IgnoreAll,
             "-b" | "--ignore-space-change" => whitespace = WhitespaceMode::IgnoreChange,
             "--ignore-space-at-eol" => whitespace = WhitespaceMode::IgnoreEol,
-            "--font" => font = Some(PathBuf::from(value("--font")?)),
+            "--config" => {
+                value("--config")?;
+            }
+            "--font" => font = Some(value("--font")?),
             "--font-size" => {
                 font_pt = value("--font-size")?
                     .parse()

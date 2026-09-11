@@ -45,18 +45,30 @@ pub struct FontSet {
 }
 
 impl FontSet {
-    /// Loads the first usable font from `explicit` (if given) or the default candidates.
-    pub fn load(explicit: Option<&Path>, px: f32) -> Result<FontSet, String> {
+    /// Loads the first usable font from `explicit` (a file path or a family name, see
+    /// [`resolve`]) or the default candidates. A configured font that cannot be used is
+    /// reported on stderr and the defaults are tried.
+    pub fn load(explicit: Option<&str>, px: f32) -> Result<FontSet, String> {
         let _s = trace::span("font-load");
         let mut candidates: Vec<(PathBuf, u32)> = Vec::new();
-        if let Some(p) = explicit {
-            candidates.push((p.to_path_buf(), 0));
+        if let Some(spec) = explicit {
+            match resolve(spec) {
+                Some(p) => candidates.push((p, 0)),
+                None => eprintln!("diffvader: font {spec:?} not found; using the default font"),
+            }
         }
         candidates.extend(DEFAULT_FONTS.iter().map(|(p, i)| (PathBuf::from(p), *i)));
         let mut last_err = String::from("no font candidates");
         for (path, index) in &candidates {
             match load_face(path, *index, px) {
                 Ok(font) => {
+                    if explicit.is_some() && candidates.first().is_some_and(|c| c.0 != *path) {
+                        eprintln!(
+                            "diffvader: cannot use font {:?}; using {}",
+                            explicit.unwrap_or(""),
+                            path.display()
+                        );
+                    }
                     return Ok(FontSet {
                         primary: Face { font },
                         fallback_paths: FALLBACK_FONTS
@@ -103,6 +115,80 @@ impl FontSet {
         }
         self.fallbacks.iter().find(|f| f.font.has_glyph(c))
     }
+}
+
+const FONT_DIRS: &[&str] = &[
+    "~/Library/Fonts",
+    "/Library/Fonts",
+    "/System/Library/Fonts",
+    "/System/Library/Fonts/Supplemental",
+    "/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts",
+];
+
+/// A font file for `spec`: the path itself when it exists, else the font file in the usual
+/// directories whose name best matches the family name. "JetBrains Mono" matches
+/// `JetBrainsMono-Regular.ttf`; a regular / book weight is preferred, then the shortest
+/// name, so "Fira Code" picks `FiraCode-Regular.ttf` over `FiraCode-Bold.ttf`.
+pub fn resolve(spec: &str) -> Option<PathBuf> {
+    let as_path = Path::new(spec);
+    if as_path.is_file() {
+        return Some(as_path.to_path_buf());
+    }
+    let _s = trace::span("font-resolve");
+    let want = normalize(spec);
+    if want.is_empty() {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut best: Option<(u8, usize, PathBuf)> = None;
+    for dir in FONT_DIRS {
+        let dir = match dir.strip_prefix("~/") {
+            Some(rest) => match &home {
+                Some(h) => h.join(rest),
+                None => continue,
+            },
+            None => PathBuf::from(dir),
+        };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            if !matches!(ext.as_deref(), Some("ttf" | "otf" | "ttc")) {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let stem = normalize(stem);
+            let Some(rest) = stem.strip_prefix(want.as_str()) else {
+                continue;
+            };
+            let rank = match rest {
+                "" | "regular" | "book" | "roman" => 0,
+                "medium" | "text" => 1,
+                r if r.contains("italic") || r.contains("oblique") => 3,
+                _ => 2,
+            };
+            let key = (rank, rest.len());
+            if best.as_ref().is_none_or(|(r, l, _)| key < (*r, *l)) {
+                best = Some((rank, rest.len(), path));
+            }
+        }
+    }
+    best.map(|(_, _, p)| p)
+}
+
+/// Lowercase alphanumerics only, so "SF Mono", "SFMono" and "sf-mono" compare equal.
+fn normalize(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 fn load_face(path: &Path, index: u32, px: f32) -> Result<fontdue::Font, String> {

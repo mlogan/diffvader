@@ -41,7 +41,8 @@ pub struct Options {
     pub input: Input,
     pub left_title: String,
     pub right_title: String,
-    pub font: Option<PathBuf>,
+    /// Font file path or family name; `None` for the built-in default.
+    pub font: Option<String>,
     pub font_pt: f32,
     pub tab_width: u32,
     pub whitespace: WhitespaceMode,

@@ -26,7 +26,7 @@ diffvader [options] --show [COMMIT] [ARGS]    one commit against its parent (lik
   -w, --ignore-all-space       ignore all whitespace
   -b, --ignore-space-change    ignore changes in the amount of whitespace
       --ignore-space-at-eol    ignore whitespace at end of line
-      --font PATH              monospace font file (default: SF Mono, then Menlo)
+      --font PATH|NAME         monospace font file or family name (default: SF Mono, then Menlo)
       --font-size PT           font size in points (default 13)
       --tab-width N            tab stop width (default 4)
       --light                  light color theme
@@ -36,6 +36,8 @@ diffvader [options] --show [COMMIT] [ARGS]    one commit against its parent (lik
       --screenshot FILE.bmp    render the first diff frame to a BMP file and exit
       --quit-after-first-frame exit as soon as the diff is on screen (benchmarking)
       --bench-scroll N         scroll through the diff in N offscreen frames, print stats
+      --config FILE            settings file (default: ~/.config/diffvader/config)
+      --init-config            write a commented settings template there and exit
       --git-config             print the git config needed to use diffvader as a difftool
       --install-git            write that config with `git config --global`
 ```
@@ -54,6 +56,27 @@ back to the previous file. `]f` / `[f` step through files in order.
 
 `DIFFVADER_TIMING=1` and `DIFFVADER_TRACE=file.json` are equivalent to the flags, which is
 handy when git launches the tool.
+
+## Configuration
+
+`diffvader --init-config` writes a commented template to `~/.config/diffvader/config`
+(`$XDG_CONFIG_HOME/diffvader/config` if that is set, or `$DIFFVADER_CONFIG`, or
+`--config FILE`). The format is one `key = value` per line:
+
+```
+font = JetBrains Mono        # a family name, or a path to a .ttf / .otf / .ttc file
+font-size = 13
+tab-width = 4
+theme = dark                 # or light
+whitespace = exact           # or eol, change, all
+agent = claude               # or codex, gemini, or a command line with {prompt}
+```
+
+A family name is matched against the file names in `~/Library/Fonts`, `/Library/Fonts`
+and the system font directories, ignoring case, spaces and hyphens, preferring the regular
+weight: `JetBrains Mono` finds `JetBrainsMono-Regular.ttf`. Command-line flags override
+the file; a font that cannot be found or loaded is reported on stderr and the default is
+used. A malformed line is reported and the whole file ignored.
 
 ## Keys
 
