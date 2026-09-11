@@ -1205,6 +1205,7 @@ impl App {
                 if !self.first_frame_done {
                     self.first_frame_done = true;
                     trace::mark("first-frame-presented");
+                    crate::icon::install();
                 }
                 if has_diff && !self.first_diff_frame_presented {
                     self.first_diff_frame_presented = true;

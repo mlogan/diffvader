@@ -5,6 +5,7 @@ mod font;
 mod fuzzy;
 mod git;
 mod gpu;
+mod icon;
 mod keys;
 mod text;
 mod theme;

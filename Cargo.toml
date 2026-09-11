@@ -16,6 +16,10 @@ libc = "0.2"
 memmap2 = "0.9"
 memchr = "2"
 unicode-width = "0.2"
+# Same versions winit uses, so these add no compile time; needed only for the Dock icon.
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.2", features = ["NSData"] }
 
 [profile.release]
 opt-level = 3
