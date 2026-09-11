@@ -105,6 +105,8 @@ struct Picker {
     selected: usize,
     scroll: usize,
     results: Vec<PickResult>,
+    /// Opened with ⌥↑/⌥↓: the list is in file order and releasing ⌥ opens the selection.
+    browse: bool,
 }
 
 const PICKER_ROWS: usize = 14;
@@ -824,6 +826,7 @@ impl App {
             selected: 0,
             scroll: 0,
             results: Vec::new(),
+            browse: false,
         };
         self.fill_picker(&mut p);
         // Enter on a fresh picker goes to the previously viewed file.
@@ -831,6 +834,50 @@ impl App {
             p.selected = 1;
         }
         self.picker = Some(p);
+    }
+
+    /// ⌥↓ / ⌥↑: show the file list in order with the neighbor selected; each further press
+    /// moves one file, releasing ⌥ (or Enter) opens it.
+    fn browse_files(&mut self, delta: i64) {
+        if self.files.is_empty() {
+            return;
+        }
+        let n = self.files.len();
+        if self.picker.as_ref().is_none_or(|p| !p.browse) {
+            let results = (0..n)
+                .map(|file| PickResult {
+                    file,
+                    positions: Vec::new(),
+                })
+                .collect();
+            self.picker = Some(Picker {
+                query: String::new(),
+                selected: self.current,
+                scroll: 0,
+                results,
+                browse: true,
+            });
+        }
+        let p = self.picker.as_mut().unwrap();
+        p.selected = (p.selected as i64 + delta).rem_euclid(n as i64) as usize;
+        if p.selected < p.scroll {
+            p.scroll = p.selected;
+        } else if p.selected >= p.scroll + PICKER_ROWS {
+            p.scroll = p.selected + 1 - PICKER_ROWS;
+        }
+    }
+
+    /// Called when ⌥ is released: commits a browse selection.
+    fn browse_commit(&mut self) {
+        let Some(p) = &self.picker else { return };
+        if !p.browse {
+            return;
+        }
+        let file = p.results.get(p.selected).map(|r| r.file);
+        self.picker = None;
+        if let Some(f) = file {
+            self.switch_to(f);
+        }
     }
 
     fn fill_picker(&self, p: &mut Picker) {
@@ -940,6 +987,7 @@ impl App {
                 }
             }
             Key::Character(s) => {
+                p.browse = false;
                 p.query.push_str(s);
                 self.fill_picker(&mut p);
             }
@@ -1937,12 +1985,12 @@ fn build_frame(app: &mut App, lay: &Layout) {
         let ty = iy + 2.0 * s;
         let prompt_w = p.text(bx + pad, ty, "› ", th.status_dim);
         let qw = if pk.query.is_empty() {
-            p.text(
-                bx + pad + prompt_w,
-                ty,
-                "type to filter files",
-                th.status_dim,
-            );
+            let hint = if pk.browse {
+                "⌥↑ / ⌥↓ choose, release ⌥ to open"
+            } else {
+                "type to filter files"
+            };
+            p.text(bx + pad + prompt_w, ty, hint, th.status_dim);
             0.0
         } else {
             p.text(bx + pad + prompt_w, ty, &pk.query, th.fg)
@@ -2104,7 +2152,7 @@ const HELP_LINES: &[&str] = &[
     "  gg / G / :N          top / bottom / row N",
     "  zt / zz / zb         cursor to top / center / bottom",
     "  h / l / 0 / $        scroll horizontally",
-    "  ⌘P  or  :e           open a file (fuzzy)        ]f / [f   next / previous file",
+    "  ⌘P  or  :e           open a file (fuzzy)        ]f / [f  ⌥↓ / ⌥↑  next / previous file",
     "  /pat  n  N           search (smart case)",
     "  w  or  :ws <mode>    cycle whitespace: exact, eol, change, all",
     "  + / -  (⌘= / ⌘-)     zoom      t  toggle light/dark",
@@ -2217,7 +2265,15 @@ impl ApplicationHandler<()> for App {
                     }
                 }
             }
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                if !self.modifiers.alt_key() {
+                    self.browse_commit();
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
                     return;
@@ -2225,7 +2281,15 @@ impl ApplicationHandler<()> for App {
                 trace::mark("key");
                 let ctrl = self.modifiers.control_key();
                 let cmd = self.modifiers.super_key();
-                if self.picker.is_some() {
+                let alt = self.modifiers.alt_key();
+                let arrow = match event.logical_key {
+                    Key::Named(NamedKey::ArrowDown) => Some(1),
+                    Key::Named(NamedKey::ArrowUp) => Some(-1),
+                    _ => None,
+                };
+                if let (true, Some(d)) = (alt, arrow) {
+                    self.browse_files(d);
+                } else if self.picker.is_some() {
                     self.picker_key(&event.logical_key, ctrl, cmd);
                 } else {
                     let input = KeyInput {
