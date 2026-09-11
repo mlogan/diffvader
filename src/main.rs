@@ -1,4 +1,5 @@
 mod app;
+mod comments;
 mod diff;
 mod difftool;
 mod explain;

@@ -48,6 +48,8 @@ pub enum Action {
     Explain,
     /// Ask for a slightly longer explanation of the current change.
     Expand,
+    /// Type a review comment on the current change.
+    Comment,
     Quit,
     /// A message for the status bar (e.g. an unknown `:` command).
     Message(String),
@@ -263,6 +265,7 @@ impl Vi {
             'w' => Action::CycleWhitespace,
             'e' => Action::Explain,
             'E' => Action::Expand,
+            'i' => Action::Comment,
             't' => Action::ToggleTheme,
             'q' => Action::Quit,
             '?' => Action::ToggleHelp,
@@ -385,6 +388,7 @@ fn run_command(cmd: &str) -> Action {
         "h" | "help" => Action::ToggleHelp,
         "explain" | "ex" => Action::Explain,
         "expand" | "more" => Action::Expand,
+        "comment" | "c" => Action::Comment,
         "n" | "next" => Action::NextFile(1),
         "N" | "prev" | "previous" => Action::PrevFile(1),
         "e" | "edit" | "files" | "f" => Action::OpenPicker,

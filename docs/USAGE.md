@@ -77,6 +77,7 @@ handy when git launches the tool.
 | `t` | toggle light / dark theme |
 | `e` `:explain` | explain the change under the cursor with an AI agent (or the first unexplained change in view) |
 | `E` `:expand` | ask for slightly more detail on the current explanation |
+| `i` `:comment` | type a review comment on the change under the cursor (Enter saves, Esc cancels, empty removes) |
 | `?` | key reference overlay (any key or click closes it) |
 | `q` `ZZ` `:q` `⌘Q` `⌘W` | quit |
 
@@ -102,6 +103,16 @@ re-sends the previous text on the agent's default model and asks for a little mo
 Answers appear in a panel above the status bar whenever the cursor is on an explained
 change; the gutter icon shows `…` while the agent works, `•` when done and `!` on an
 error. Agents still running when you quit are terminated.
+
+## Review comments
+
+`i` opens a one-line editor in the panel for a comment on the change under the cursor;
+commented changes get a `#` in the right gutter and the comment shows in the panel. When
+you quit with comments pending, a modal shows them all combined into one prompt for an
+agent: each change as a unified diff followed by your comment, with the comparison and
+repository named at the top. `Y` copies the prompt to the clipboard and quits, `Q` quits
+without copying, `Esc` goes back. Either way the prompt is written to a file in the temp
+directory and its path is printed on exit, in case the clipboard gets overwritten.
 
 ## What the colors mean
 

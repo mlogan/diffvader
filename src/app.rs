@@ -14,8 +14,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::comments;
 use crate::diff::{self, DiffResult, IntraDiff, Row, RowKind, WhitespaceMode, NONE};
-use crate::explain::{self, Agent, Note, NoteState, Notes};
+use crate::explain::{self, Agent, HunkKey, Note, NoteState, Notes};
 use crate::files::{FileEntry, FileSet, Source, Status};
 use crate::font::{Atlas, FontSet};
 use crate::fuzzy;
@@ -102,6 +103,34 @@ struct FileSlot {
     view: View,
     stats: Option<(u32, u32)>,
     notes: Notes,
+    /// Review comments typed with `i`, keyed like notes.
+    comments: HashMap<HunkKey, String>,
+}
+
+/// A comment being typed in the bottom panel.
+struct CommentEdit {
+    hunk: usize,
+    key: HunkKey,
+    buf: String,
+}
+
+/// The quit-time prompt built from every comment, shown until the user copies it or
+/// quits without copying.
+struct QuitModal {
+    text: String,
+    path: Option<PathBuf>,
+    count: usize,
+    lines: Vec<String>,
+}
+
+/// What the bottom panel shows for the change under the cursor.
+struct Panel {
+    title: String,
+    title_color: u32,
+    hint: String,
+    lines: Vec<(String, u32)>,
+    /// Comment being typed, drawn with a caret above the lines.
+    input: Option<String>,
 }
 
 struct PickResult {
@@ -176,6 +205,10 @@ pub struct App {
     deadline: Option<Instant>,
     /// `DIFFVADER_KEYS` not yet fed (see `render`).
     debug_keys: String,
+    comment_edit: Option<CommentEdit>,
+    quit_modal: Option<QuitModal>,
+    /// Printed to stderr when the process exits (where the comment prompt went).
+    exit_notes: Vec<String>,
     /// Probed on the first explain request, not at startup.
     agent: Option<Result<Agent, String>>,
     /// Repository root (or best-effort directory) agents run in; resolved lazily.
@@ -279,6 +312,9 @@ impl App {
             bench_start: None,
             deadline: None,
             debug_keys,
+            comment_edit: None,
+            quit_modal: None,
+            exit_notes: Vec::new(),
             agent: None,
             root: None,
             children: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -334,9 +370,12 @@ impl App {
         let text_top = header_h;
         let avail = (h - header_h - status_h).max(0.0);
         let panel_h = match self.panel_content() {
-            Some((_, lines)) => ((lines.len() as f32 + 1.0) * self.line_h + 8.0 * s)
-                .min((avail * 0.45).max(2.0 * self.line_h))
-                .round(),
+            Some(panel) => {
+                let rows = panel.lines.len() + 1 + usize::from(panel.input.is_some());
+                (rows as f32 * self.line_h + 8.0 * s)
+                    .min((avail * 0.45).max(3.0 * self.line_h))
+                    .round()
+            }
             None => 0.0,
         };
         let text_h = (avail - panel_h).max(0.0);
@@ -384,27 +423,92 @@ impl App {
         ((w / self.cell_w) as usize).saturating_sub(2).max(8)
     }
 
-    /// The note for the change under the cursor, with its body wrapped for the panel. An
-    /// error is shown as the body of a failed note; a pending expansion shows the old text.
-    fn panel_content(&self) -> Option<(Note, Vec<String>)> {
-        let note = self.current_note()?.clone();
-        let body = match &note.state {
-            NoteState::Failed(e) => format!("error: {e}"),
-            _ => note.text.clone(),
+    /// The comment and explanation for the change under the cursor, wrapped for the panel.
+    /// A failed note shows its error as the body; a pending expansion shows the old text.
+    fn panel_content(&self) -> Option<Panel> {
+        let th = self.theme;
+        let idx = self.current_hunk();
+        let key = idx.map(|i| explain::hunk_key(&self.loaded().unwrap().diff, i));
+        let slot = self.files.get(self.current);
+        let note = key.and_then(|k| slot?.notes.get(&k));
+        let comment = key.and_then(|k| slot?.comments.get(&k));
+        let edit = self.comment_edit.as_ref();
+        if edit.is_none() && note.is_none() && comment.is_none() {
+            return None;
+        }
+        let cols = self.panel_cols();
+        let mut lines = Vec::new();
+        if let (Some(c), None) = (comment, edit) {
+            for (i, l) in explain::wrap(c, cols.saturating_sub(2))
+                .into_iter()
+                .enumerate()
+            {
+                let prefix = if i == 0 { "# " } else { "  " };
+                lines.push((format!("{prefix}{l}"), th.picker_match));
+            }
+        }
+        if let Some(n) = note {
+            let body = match &n.state {
+                NoteState::Failed(e) => format!("error: {e}"),
+                _ => n.text.clone(),
+            };
+            let color = match n.state {
+                NoteState::Pending => th.status_dim,
+                _ => th.fg,
+            };
+            if !body.is_empty() {
+                lines.extend(explain::wrap(&body, cols).into_iter().map(|l| (l, color)));
+            }
+        }
+        let change = idx.map_or(0, |i| i + 1);
+        let (title, title_color, hint) = match (edit, note) {
+            (Some(e), _) => (
+                format!("comment on change {}", e.hunk + 1),
+                th.picker_match,
+                "Enter saves   Esc cancels   empty removes".to_string(),
+            ),
+            (None, Some(n)) => {
+                let comment_hint = if comment.is_some() {
+                    "i  edit comment"
+                } else {
+                    "i  comment"
+                };
+                match &n.state {
+                    NoteState::Pending if n.text.is_empty() => (
+                        format!("explaining with {}…", n.agent),
+                        th.status_dim,
+                        comment_hint.to_string(),
+                    ),
+                    NoteState::Pending => (
+                        format!("expanding with {}…", n.agent),
+                        th.status_dim,
+                        comment_hint.to_string(),
+                    ),
+                    NoteState::Done => (
+                        format!("explanation · {} · pass {}", n.agent, n.level + 1),
+                        th.status_accent,
+                        format!("E  more detail   {comment_hint}"),
+                    ),
+                    NoteState::Failed(_) => (
+                        format!("explanation failed · {}", n.agent),
+                        th.error_fg,
+                        format!("e  retry   {comment_hint}"),
+                    ),
+                }
+            }
+            (None, None) => (
+                format!("comment on change {change}"),
+                th.picker_match,
+                "i  edit   e  explain".to_string(),
+            ),
         };
-        let lines = if body.is_empty() {
-            Vec::new()
-        } else {
-            explain::wrap(&body, self.panel_cols())
-        };
-        Some((note, lines))
-    }
-
-    fn current_note(&self) -> Option<&Note> {
-        let idx = self.current_hunk()?;
-        let l = self.loaded()?;
-        let key = explain::hunk_key(&l.diff, idx);
-        self.files.get(self.current)?.notes.get(&key)
+        Some(Panel {
+            title,
+            title_color,
+            hint,
+            lines,
+            input: edit.map(|e| e.buf.clone()),
+        })
     }
 
     /// The panel appearing under the cursor shrinks the text area; scroll just enough to
@@ -639,7 +743,8 @@ impl App {
             Action::ToggleHelp => self.help = !self.help,
             Action::Explain => self.explain(&lay, false),
             Action::Expand => self.explain(&lay, true),
-            Action::Quit => self.want_exit = true,
+            Action::Comment => self.open_comment_edit(),
+            Action::Quit => self.quit(),
             Action::Message(m) => {
                 self.message = if m.is_empty() { None } else { Some(m) };
             }
@@ -647,6 +752,187 @@ impl App {
         self.clamp_scroll();
         self.clamp_cursor();
         self.nudge_for_panel();
+    }
+
+    // ---- comments ------------------------------------------------------------------------
+
+    fn open_comment_edit(&mut self) {
+        let Some(idx) = self.current_hunk() else {
+            self.message = Some("move onto a change first (j / k)".into());
+            return;
+        };
+        let key = explain::hunk_key(&self.loaded().unwrap().diff, idx);
+        let buf = self.files[self.current]
+            .comments
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        self.comment_edit = Some(CommentEdit {
+            hunk: idx,
+            key,
+            buf,
+        });
+        self.nudge_for_panel();
+    }
+
+    fn comment_key(&mut self, key: &Key, ctrl: bool, cmd: bool) {
+        let Some(mut e) = self.comment_edit.take() else {
+            return;
+        };
+        match key {
+            Key::Named(NamedKey::Escape) => {}
+            Key::Named(NamedKey::Enter) => {
+                let text = e.buf.trim().to_string();
+                let comments = &mut self.files[self.current].comments;
+                if text.is_empty() {
+                    comments.remove(&e.key);
+                    self.message = Some("comment removed".into());
+                } else {
+                    comments.insert(e.key, text);
+                    self.message = Some(format!("comment saved on change {}", e.hunk + 1));
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                e.buf.pop();
+                self.comment_edit = Some(e);
+            }
+            Key::Named(NamedKey::Space) => {
+                e.buf.push(' ');
+                self.comment_edit = Some(e);
+            }
+            Key::Character(s) if ctrl && s.as_str() == "u" => {
+                e.buf.clear();
+                self.comment_edit = Some(e);
+            }
+            Key::Character(s) if !ctrl && !cmd => {
+                e.buf.push_str(s);
+                self.comment_edit = Some(e);
+            }
+            _ => self.comment_edit = Some(e),
+        }
+    }
+
+    /// Every comment, in file order and then diff order, with the change it refers to.
+    fn review_items(&self) -> Vec<comments::Item> {
+        let mut items = Vec::new();
+        for f in &self.files {
+            if f.comments.is_empty() {
+                continue;
+            }
+            let loaded = match &f.state {
+                State::Ready(l) => Some(l),
+                _ => None,
+            };
+            let mut keyed: Vec<(Option<usize>, &HunkKey, &String)> = f
+                .comments
+                .iter()
+                .map(|(k, c)| {
+                    let idx = loaded.and_then(|l| {
+                        (0..l.diff.hunks.len()).find(|&i| explain::hunk_key(&l.diff, i) == *k)
+                    });
+                    (idx, k, c)
+                })
+                .collect();
+            keyed.sort_by_key(|(idx, k, _)| (idx.unwrap_or(usize::MAX), **k));
+            for (idx, _, c) in keyed {
+                let (index, total, excerpt) = match (idx, loaded) {
+                    (Some(i), Some(l)) => (
+                        i + 1,
+                        l.diff.hunks.len(),
+                        Some(explain::excerpt(&l.left, &l.right, &l.diff, i)),
+                    ),
+                    _ => (0, loaded.map_or(0, |l| l.diff.hunks.len()), None),
+                };
+                items.push(comments::Item {
+                    file: f.entry.rel.clone(),
+                    index,
+                    total,
+                    excerpt,
+                    comment: c.clone(),
+                });
+            }
+        }
+        items
+    }
+
+    /// What the whole session compares, for the review prompt's first line.
+    fn comparison_summary(&self) -> String {
+        match &self.opts.input {
+            Input::Git(args) if args.is_empty() => {
+                "`git diff` (the working tree against the index)".into()
+            }
+            Input::Git(args) => format!("`git diff {}`", args.join(" ")),
+            Input::Show(commit, rest) => format!(
+                "commit {commit} against its first parent (`git show {commit}{}`)",
+                rest.iter().map(|a| format!(" {a}")).collect::<String>()
+            ),
+            Input::Pair(l, r) => format!("{} against {}", l.display(), r.display()),
+            Input::Session(_) => "a `git difftool` run".into(),
+        }
+    }
+
+    /// `q` and friends. With comments pending, shows the review prompt first: `Y` copies it
+    /// and quits, `Q` quits without copying; either way it is saved to a temp file.
+    fn quit(&mut self) {
+        if self.quit_modal.is_some() {
+            self.want_exit = true;
+            return;
+        }
+        let items = self.review_items();
+        if items.is_empty() {
+            self.want_exit = true;
+            return;
+        }
+        let root = self.root();
+        let text = comments::build_prompt(&items, &self.comparison_summary(), &root);
+        let path = match comments::save(&text) {
+            Ok(p) => {
+                self.exit_notes
+                    .push(format!("comment prompt saved to {}", p.display()));
+                Some(p)
+            }
+            Err(e) => {
+                self.exit_notes
+                    .push(format!("could not save the comment prompt: {e}"));
+                None
+            }
+        };
+        // Shown as-is (truncated to the box) so diff indentation survives.
+        let lines = text.lines().map(String::from).collect();
+        self.quit_modal = Some(QuitModal {
+            text,
+            path,
+            count: items.len(),
+            lines,
+        });
+    }
+
+    fn modal_key(&mut self, key: &Key, cmd: bool) {
+        let Some(m) = self.quit_modal.as_ref() else {
+            return;
+        };
+        let ch = match key {
+            Key::Character(s) => s.chars().next(),
+            _ => None,
+        };
+        match ch {
+            Some('y') | Some('Y') => {
+                match comments::copy_to_clipboard(&m.text) {
+                    Ok(()) => self
+                        .exit_notes
+                        .push("comment prompt copied to the clipboard".into()),
+                    Err(e) => self.exit_notes.push(format!("clipboard copy failed: {e}")),
+                }
+                self.want_exit = true;
+            }
+            Some('q') | Some('Q') => self.want_exit = true,
+            Some('w') if cmd => self.want_exit = true,
+            _ => {
+                self.quit_modal = None;
+                self.exit_notes.clear();
+                self.message = Some("quit cancelled; comments kept".into());
+            }
+        }
     }
 
     // ---- explanations --------------------------------------------------------------------
@@ -1385,6 +1671,7 @@ impl App {
                             view: View::default(),
                             stats: None,
                             notes: Notes::new(),
+                            comments: HashMap::new(),
                         })
                         .collect();
                     self.current = 0;
@@ -1399,6 +1686,7 @@ impl App {
                         view: View::default(),
                         stats: None,
                         notes: Notes::new(),
+                        comments: HashMap::new(),
                     }));
                     self.update_title();
                 }
@@ -1520,15 +1808,13 @@ impl App {
             };
             self.debug_keys = later;
             for ch in now.chars() {
-                let key = Key::Character(ch.to_string().into());
-                let input = KeyInput {
-                    key: &key,
-                    ctrl: false,
-                    cmd: false,
+                let key = match ch {
+                    '\n' => Key::Named(NamedKey::Enter),
+                    '\x1b' => Key::Named(NamedKey::Escape),
+                    ' ' => Key::Named(NamedKey::Space),
+                    _ => Key::Character(ch.to_string().into()),
                 };
-                if let Some(action) = self.vi.key(input) {
-                    self.apply(action);
-                }
+                self.handle_key(&key, false, false);
             }
         }
         if has_diff && !self.first_diff_frame_done && self.opts.screenshot.is_some() {
@@ -1687,8 +1973,41 @@ impl App {
         d
     }
 
+    /// One key press, routed to whichever layer is on top: help, the quit modal, the
+    /// comment editor, ⌘-browse, the picker, then the vi state machine.
+    fn handle_key(&mut self, key: &Key, ctrl: bool, cmd: bool) {
+        let arrow = match key {
+            Key::Named(NamedKey::ArrowDown) => Some(1),
+            Key::Named(NamedKey::ArrowUp) => Some(-1),
+            _ => None,
+        };
+        if self.help {
+            // The help overlay is modal: any key dismisses it and is consumed.
+            self.help = false;
+        } else if self.quit_modal.is_some() {
+            self.modal_key(key, cmd);
+        } else if self.comment_edit.is_some() {
+            self.comment_key(key, ctrl, cmd);
+        } else if let (true, Some(d)) = (cmd, arrow) {
+            self.browse_files(d);
+        } else if self.picker.is_some() {
+            self.picker_key(key, ctrl, cmd);
+        } else {
+            let input = KeyInput { key, ctrl, cmd };
+            if !self.vi.in_command_line() {
+                self.message = None;
+            }
+            if let Some(action) = self.vi.key(input) {
+                self.apply(action);
+            }
+        }
+    }
+
     fn finish(&mut self) {
         explain::kill_children(&self.children);
+        for n in &self.exit_notes {
+            eprintln!("diffvader: {n}");
+        }
         trace::run_exit_hook();
     }
 }
@@ -2002,6 +2321,7 @@ fn build_frame(app: &mut App, lay: &Layout) {
         message,
         vi,
         picker,
+        quit_modal,
         ws_mode,
         opts,
         ..
@@ -2134,6 +2454,11 @@ fn build_frame(app: &mut App, lay: &Layout) {
                         Some(NoteState::Failed(_)) => ('!', th.error_fg),
                     };
                     p.glyph(lay.pane_x[0] + 4.0 * s, y, glyph, color);
+                    let commented = slot
+                        .is_some_and(|f| f.comments.contains_key(&explain::hunk_key(&l.diff, i)));
+                    if commented {
+                        p.glyph(lay.pane_x[1] + 4.0 * s, y, '#', th.picker_match);
+                    }
                 }
             }
 
@@ -2366,62 +2691,49 @@ fn build_frame(app: &mut App, lay: &Layout) {
         p.text(center_x, status_y, &ws_text, th.status_dim);
     }
 
-    // ---- explanation panel ----
-    if let Some((note, lines)) = &panel {
+    // ---- comment / explanation panel ----
+    if let Some(panel) = &panel {
         let py = lay.panel_y;
         p.draw.begin(full);
         p.rect(0.0, py, lay.w, lay.panel_h, th.picker_bg);
         p.rect(0.0, py, lay.w, (1.0 * s).round(), th.picker_border);
         let pad = cell_w;
         let mut y = py + 4.0 * s;
-        let (title, color, hint) = match &note.state {
-            NoteState::Pending if note.text.is_empty() => (
-                format!("explaining with {}…", note.agent),
-                th.status_dim,
-                "",
-            ),
-            NoteState::Pending => (format!("expanding with {}…", note.agent), th.status_dim, ""),
-            NoteState::Done => (
-                format!("explanation · {} · pass {}", note.agent, note.level + 1),
-                th.status_accent,
-                "E  more detail",
-            ),
-            NoteState::Failed(_) => (
-                format!("explanation failed · {}", note.agent),
-                th.error_fg,
-                "e  retry",
-            ),
-        };
-        p.text(pad, y, &title, color);
-        if !hint.is_empty() {
-            let hw = p.text_width(hint);
-            p.text(lay.w - hw - pad, y, hint, th.status_dim);
+        p.text(pad, y, &panel.title, panel.title_color);
+        if !panel.hint.is_empty() {
+            let hw = p.text_width(&panel.hint);
+            p.text(lay.w - hw - pad, y, &panel.hint, th.status_dim);
         }
         y += line_h;
-        let max_lines = ((py + lay.panel_h - y - 2.0 * s) / line_h).floor() as usize;
-        let body_color = match note.state {
-            NoteState::Pending => th.status_dim,
-            _ => th.fg,
-        };
-        for (i, line) in lines.iter().take(max_lines).enumerate() {
-            p.text(pad, y + i as f32 * line_h, line, body_color);
+        if let Some(input) = &panel.input {
+            p.rect(pad / 2.0, y, lay.w - pad, line_h, th.gutter_bg);
+            let pw = p.text(pad, y, "› ", th.status_dim);
+            let tw = p.text(pad + pw, y, input, th.fg);
+            p.rect(
+                pad + pw + tw,
+                y,
+                (2.0 * s).round(),
+                line_h,
+                th.status_accent,
+            );
+            y += line_h;
         }
-        if lines.len() > max_lines && max_lines > 0 {
-            let more = format!("… {} more lines", lines.len() - max_lines);
+        let max_lines = ((py + lay.panel_h - y - 2.0 * s) / line_h).floor() as usize;
+        for (i, (line, color)) in panel.lines.iter().take(max_lines).enumerate() {
+            p.text(pad, y + i as f32 * line_h, line, *color);
+        }
+        if panel.lines.len() > max_lines && max_lines > 0 {
+            let more = format!("… {} more lines", panel.lines.len() - max_lines);
             let mw = p.text_width(&more);
+            let my = y + (max_lines - 1) as f32 * line_h;
             p.rect(
                 lay.w - mw - 2.0 * pad,
-                y + (max_lines - 1) as f32 * line_h,
+                my,
                 mw + 2.0 * pad,
                 line_h,
                 th.picker_bg,
             );
-            p.text(
-                lay.w - mw - pad,
-                y + (max_lines - 1) as f32 * line_h,
-                &more,
-                th.status_dim,
-            );
+            p.text(lay.w - mw - pad, my, &more, th.status_dim);
         }
     }
 
@@ -2540,6 +2852,58 @@ fn build_frame(app: &mut App, lay: &Layout) {
         }
     }
 
+    // ---- quit modal: the review prompt ----
+    if let Some(m) = quit_modal {
+        let box_w = (lay.w - 4.0 * cell_w)
+            .min(140.0 * cell_w)
+            .max(30.0 * cell_w);
+        let max_h = lay.text_top + lay.text_h * 0.9;
+        let head = [
+            format!(
+                "{} comment{} on this diff.   Y  copy the prompt and quit     Q  quit without copying     Esc  back",
+                m.count,
+                if m.count == 1 { "" } else { "s" }
+            ),
+            match &m.path {
+                Some(p) => format!("saved to {}", p.display()),
+                None => "could not be saved to a file".to_string(),
+            },
+        ];
+        let avail = ((max_h - lay.text_top) / line_h).floor() as usize;
+        let shown = m.lines.len().min(avail.saturating_sub(head.len() + 2));
+        let box_h = (head.len() + 1 + shown) as f32 * line_h + 8.0 * s;
+        let bx = ((lay.w - box_w) / 2.0).round();
+        let by = lay.text_top + 8.0 * s;
+        p.rect(
+            bx - 2.0 * s,
+            by - 2.0 * s,
+            box_w + 4.0 * s,
+            box_h + 4.0 * s,
+            th.status_accent,
+        );
+        p.rect(bx, by, box_w, box_h, th.status_bg);
+        let max_cells = ((box_w - 2.0 * cell_w) / cell_w) as usize;
+        let mut y = by + 4.0 * s;
+        for (i, l) in head.iter().enumerate() {
+            let color = if i == 0 {
+                th.status_accent
+            } else {
+                th.status_dim
+            };
+            p.text(bx + cell_w, y, &truncate_right(l, max_cells), color);
+            y += line_h;
+        }
+        y += line_h;
+        for l in m.lines.iter().take(shown) {
+            p.text(bx + cell_w, y, &truncate_right(l, max_cells), th.fg);
+            y += line_h;
+        }
+        if m.lines.len() > shown {
+            let more = format!("… {} more lines in the file", m.lines.len() - shown);
+            p.text(bx + cell_w, y - line_h, &more, th.status_dim);
+        }
+    }
+
     // ---- help overlay ----
     if *help {
         let lines = HELP_LINES;
@@ -2596,6 +2960,15 @@ fn write_bmp(path: &Path, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
     f.flush()
 }
 
+fn truncate_right(s: &str, max_cells: usize) -> String {
+    if s.chars().count() <= max_cells || max_cells < 2 {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_cells - 1).collect();
+    out.push('…');
+    out
+}
+
 fn truncate_left(s: &str, max_cells: usize) -> String {
     let n = s.chars().count();
     if n <= max_cells || max_cells < 2 {
@@ -2620,6 +2993,7 @@ const HELP_LINES: &[&str] = &[
     "  w  or  :ws <mode>    cycle whitespace: exact, eol, change, all",
     "  e / E               explain this change with an AI agent / ask for more detail",
     "                       (or click the ? in the gutter)",
+    "  i                    comment on this change; on quit, Y copies all comments as a prompt",
     "  + / -  (⌘= / ⌘-)     zoom      t  toggle light/dark",
     "  q  ZZ  :q            quit      ?  show this help (any key closes it)",
 ];
@@ -2701,7 +3075,14 @@ impl ApplicationHandler<()> for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => {
+                self.quit();
+                if self.want_exit {
+                    el.exit();
+                } else if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(g) = &mut self.gpu {
                     g.resize(size.width, size.height);
@@ -2747,31 +3128,7 @@ impl ApplicationHandler<()> for App {
                 trace::mark("key");
                 let ctrl = self.modifiers.control_key();
                 let cmd = self.modifiers.super_key();
-                let arrow = match event.logical_key {
-                    Key::Named(NamedKey::ArrowDown) => Some(1),
-                    Key::Named(NamedKey::ArrowUp) => Some(-1),
-                    _ => None,
-                };
-                if self.help {
-                    // The help overlay is modal: any key dismisses it and is consumed.
-                    self.help = false;
-                } else if let (true, Some(d)) = (cmd, arrow) {
-                    self.browse_files(d);
-                } else if self.picker.is_some() {
-                    self.picker_key(&event.logical_key, ctrl, cmd);
-                } else {
-                    let input = KeyInput {
-                        key: &event.logical_key,
-                        ctrl,
-                        cmd,
-                    };
-                    if !self.vi.in_command_line() {
-                        self.message = None;
-                    }
-                    if let Some(action) = self.vi.key(input) {
-                        self.apply(action);
-                    }
-                }
+                self.handle_key(&event.logical_key, ctrl, cmd);
                 if self.want_exit {
                     el.exit();
                     return;
@@ -2798,6 +3155,11 @@ impl ApplicationHandler<()> for App {
                     ElementState::Pressed => {
                         if self.help {
                             self.help = false;
+                        } else if self.quit_modal.is_some() {
+                            self.quit_modal = None;
+                            self.exit_notes.clear();
+                        } else if self.comment_edit.is_some() {
+                            self.comment_edit = None;
                         } else if self.picker.is_some() {
                             self.picker = None;
                         } else {
