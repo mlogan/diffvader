@@ -41,19 +41,35 @@ src/app.rs    winit handler: layout, scrolling, draw-list construction, status b
 ## Progress
 
 - [x] Repo, toolchain pin (1.96.1), Cargo skeleton
-- [ ] trace.rs telemetry
-- [ ] text.rs file loading
-- [ ] diff.rs line diff + rows + whitespace modes + intra-line
-- [ ] font.rs atlas
-- [ ] gpu.rs renderer
-- [ ] app.rs layout/scroll/render
-- [ ] keys.rs vi keymap
-- [ ] git difftool integration + README
-- [ ] perf pass on large files with tracing
+- [x] trace.rs telemetry (spans, marks, Chrome trace JSON, `--timing` summary)
+- [x] text.rs file loading (mmap over 1 MiB, memchr line index, binary detection)
+- [x] diff.rs line diff + rows + whitespace modes + intra-line
+- [x] font.rs atlas (fontdue, SF Mono -> Menlo fallback, shelf packing, reset on overflow)
+- [x] gpu.rs renderer (single instanced-quad pipeline, scissored batches, offscreen paths)
+- [x] app.rs layout/scroll/render (cursor + scrolloff, hunk nav, search, zoom, themes, help)
+- [x] keys.rs vi keymap (counts, g/z/[/]/Z prefixes, `:` and `/` command lines)
+- [x] git difftool integration (`--git-config`, `--install-git`, titles from `$MERGED`)
+- [x] perf pass on large sui files (parser.c 2.2 MB: diff 27 ms, frames <1 ms median)
+- [x] cold start: GPU device + font parsing overlap AppKit init; first frame drawn in `resumed`
+
+## Measurements (2026-09-10, Mac Studio, macOS 26)
+
+Cold start to first diff frame ~140 ms. Breakdown: dyld ~15, `NSApplication
+sharedApplication` ~40, `[NSApp run]` -> `resumed` ~25, first titled NSWindow ~40, our
+GPU surface + first frame ~3. A bare Objective-C program hits the same floor (~130 ms), so
+the <100 ms target is not reachable with a standard NSWindow here. Borderless windows init
+in ~17 ms instead of ~40 ms (measured), so a custom title bar is the one remaining lever.
+
+Note for headless testing: when the screen is locked, `NSWindow.occlusionState` never
+reports visible and wgpu skips presenting. `--screenshot` and `--bench-scroll` render
+offscreen so they work regardless; `--quit-after-first-frame` fires on the first *built*
+diff frame. `DIFFVADER_EXIT_AFTER_MS=N` exits cleanly (writing traces) after N ms.
 
 ## Remaining / ideas
 
-- Search (`/`, `n`, `N`)
+- Borderless window with custom title bar (~22 ms faster cold start)
 - Folding long unchanged regions
 - Directory diff (`git difftool --dir-diff`)
+- Syntax highlighting (tree-sitter would hurt cold start; a lexer-based approach fits)
 - Optional CoreText rasterizer for pixel-identical Terminal.app text
+- Mouse: click to place cursor, drag scrollbar

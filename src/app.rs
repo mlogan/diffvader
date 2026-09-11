@@ -92,6 +92,8 @@ pub struct App {
     message: Option<String>,
     first_frame_done: bool,
     first_diff_frame_done: bool,
+    first_diff_frame_presented: bool,
+    warned_occluded: bool,
     /// Set by render when a debug flag asks to exit after the first frame.
     want_exit: bool,
     bench_remaining: u32,
@@ -171,6 +173,8 @@ impl App {
             message: None,
             first_frame_done: false,
             first_diff_frame_done: false,
+            first_diff_frame_presented: false,
+            warned_occluded: false,
             want_exit: false,
             bench_remaining: 0,
             bench_start: None,
@@ -665,16 +669,49 @@ impl App {
         let gpu = self.gpu.as_mut().unwrap();
         gpu.sync_atlas(&mut self.atlas);
         let clear = theme::to_f64(self.theme.bg);
+        let has_diff = matches!(self.state, State::Ready(_) | State::Failed(_));
+        if self.bench_remaining > 0 || (self.bench_start.is_some() && has_diff) {
+            gpu.render_offscreen(&self.draw, clear);
+            trace::frame_done(frame_start.elapsed());
+            if self.bench_remaining > 0 {
+                self.bench_step();
+                window.request_redraw();
+            } else {
+                self.bench_report();
+                self.want_exit = true;
+            }
+            return;
+        }
+        if has_diff && !self.first_diff_frame_done {
+            // The frame is built and submitted; whether it reaches the screen depends on the
+            // window being visible (see the presented mark below).
+            self.first_diff_frame_done = true;
+            trace::mark("first-diff-frame");
+            if let Some(path) = self.opts.screenshot.clone() {
+                let (w, h, rgba) = gpu.render_to_image(&self.draw, clear);
+                match write_bmp(&path, w, h, &rgba) {
+                    Ok(()) => eprintln!("diffvader: wrote screenshot {}", path.display()),
+                    Err(e) => eprintln!("diffvader: screenshot failed: {e}"),
+                }
+                self.want_exit = true;
+            }
+            if self.opts.quit_after_first_frame {
+                self.want_exit = true;
+            }
+            if let Some(n) = self.opts.bench_scroll {
+                self.bench_remaining = n;
+                self.bench_start = Some(Instant::now());
+                window.request_redraw();
+            }
+        }
         match gpu.render(&self.draw, clear) {
             Ok(()) => {
                 if !self.first_frame_done {
                     self.first_frame_done = true;
                     trace::mark("first-frame-presented");
                 }
-                if !self.first_diff_frame_done
-                    && matches!(self.state, State::Ready(_) | State::Failed(_))
-                {
-                    self.first_diff_frame_done = true;
+                if has_diff && !self.first_diff_frame_presented {
+                    self.first_diff_frame_presented = true;
                     trace::mark("first-diff-frame-presented");
                     if self.opts.timing {
                         eprintln!(
@@ -682,28 +719,6 @@ impl App {
                             trace::elapsed_us() as f64 / 1000.0
                         );
                     }
-                    if let Some(path) = self.opts.screenshot.clone() {
-                        let (w, h, rgba) = gpu.render_to_image(&self.draw, clear);
-                        match write_bmp(&path, w, h, &rgba) {
-                            Ok(()) => eprintln!("diffvader: wrote screenshot {}", path.display()),
-                            Err(e) => eprintln!("diffvader: screenshot failed: {e}"),
-                        }
-                        self.want_exit = true;
-                    }
-                    if self.opts.quit_after_first_frame {
-                        self.want_exit = true;
-                    }
-                    if let Some(n) = self.opts.bench_scroll {
-                        self.bench_remaining = n;
-                        self.bench_start = Some(Instant::now());
-                    }
-                }
-                if self.bench_remaining > 0 {
-                    self.bench_step();
-                    window.request_redraw();
-                } else if self.bench_start.is_some() {
-                    self.bench_report();
-                    self.want_exit = true;
                 }
             }
             Err(SurfaceProblem::Reconfigure) => {
@@ -714,7 +729,14 @@ impl App {
             Err(SurfaceProblem::Timeout) => window.request_redraw(),
             // Re-requesting here would spin the run loop and keep the window from ever
             // becoming visible; the Occluded(false) event triggers the next frame instead.
-            Err(SurfaceProblem::Occluded) => {}
+            Err(SurfaceProblem::Occluded) => {
+                if self.opts.timing && !self.warned_occluded {
+                    self.warned_occluded = true;
+                    eprintln!(
+                        "diffvader: window is occluded (screen locked?); frames are not presented"
+                    );
+                }
+            }
             Err(SurfaceProblem::Fatal) => eprintln!("diffvader: surface validation error"),
         }
         trace::frame_done(frame_start.elapsed());
@@ -743,7 +765,7 @@ impl App {
             .map(|t| t.elapsed())
             .unwrap_or_default();
         eprintln!(
-            "diffvader: bench-scroll {} frames in {:.1} ms wall ({:.2} ms/frame incl. vsync wait)",
+            "diffvader: bench-scroll {} frames in {:.1} ms wall ({:.2} ms/frame, offscreen)",
             n,
             wall.as_secs_f64() * 1e3,
             wall.as_secs_f64() * 1e3 / n.max(1) as f64

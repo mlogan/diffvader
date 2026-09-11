@@ -207,7 +207,7 @@ pub fn print_summary() {
     let first_frame = st
         .events
         .iter()
-        .find(|e| e.name == "first-frame-presented")
+        .find(|e| e.name == "first-diff-frame-presented" || e.name == "first-diff-frame")
         .map(|e| e.ts_us)
         .unwrap_or(u64::MAX);
     let mut startup: Vec<&Event> = st

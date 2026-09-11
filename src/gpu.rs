@@ -105,6 +105,7 @@ pub struct Gpu {
     vbuf_cap: usize,
     atlas_tex: wgpu::Texture,
     atlas_size: (u32, u32),
+    offscreen: Option<wgpu::Texture>,
 }
 
 const SHADER: &str = r#"
@@ -351,6 +352,7 @@ impl Gpu {
             vbuf_cap,
             atlas_tex,
             atlas_size: (atlas.width, atlas.height),
+            offscreen: None,
         };
         gpu.write_uniforms();
         Ok(gpu)
@@ -429,26 +431,7 @@ impl Gpu {
     /// or is outdated, in which case the caller should reconfigure and retry.
     pub fn render(&mut self, list: &DrawList, clear: [f64; 4]) -> Result<(), SurfaceProblem> {
         let _s = trace::span_arg("gpu-render", list.quads.len() as u64);
-        if list.quads.len() > self.vbuf_cap {
-            let mut cap = self.vbuf_cap;
-            while cap < list.quads.len() {
-                cap *= 2;
-            }
-            self.vbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("quads"),
-                size: (cap * std::mem::size_of::<Quad>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.vbuf_cap = cap;
-        }
-        {
-            let _s = trace::span("gpu-upload-quads");
-            if !list.quads.is_empty() {
-                self.queue
-                    .write_buffer(&self.vbuf, 0, bytemuck::cast_slice(&list.quads));
-            }
-        }
+        self.upload_quads(list);
         let frame = {
             let _s = trace::span("gpu-acquire");
             match self.surface.get_current_texture() {
@@ -540,10 +523,64 @@ impl Gpu {
         encoder.finish()
     }
 
+    /// Renders the draw list to an offscreen texture and blocks until the GPU has finished.
+    /// Used by `--bench-scroll` so frame cost can be measured without a visible window.
+    pub fn render_offscreen(&mut self, list: &DrawList, clear: [f64; 4]) {
+        let _s = trace::span_arg("gpu-render-offscreen", list.quads.len() as u64);
+        let (w, h) = (self.config.width, self.config.height);
+        if self.offscreen.as_ref().map(|t| (t.width(), t.height())) != Some((w, h)) {
+            self.offscreen = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("offscreen"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            }));
+        }
+        self.upload_quads(list);
+        let view = self
+            .offscreen
+            .as_ref()
+            .unwrap()
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let pass = self.encode_pass(list, clear, &view);
+        self.queue.submit([pass]);
+        let _w = trace::span("gpu-wait");
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    fn upload_quads(&mut self, list: &DrawList) {
+        if list.quads.len() > self.vbuf_cap {
+            let mut cap = self.vbuf_cap;
+            while cap < list.quads.len() {
+                cap *= 2;
+            }
+            self.vbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("quads"),
+                size: (cap * std::mem::size_of::<Quad>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.vbuf_cap = cap;
+        }
+        let _s = trace::span("gpu-upload-quads");
+        if !list.quads.is_empty() {
+            self.queue
+                .write_buffer(&self.vbuf, 0, bytemuck::cast_slice(&list.quads));
+        }
+    }
+
     /// Renders the draw list to an offscreen texture and returns tightly packed RGBA8 pixels.
-    /// Assumes `render` has already uploaded `list` to the vertex buffer this frame.
     pub fn render_to_image(&mut self, list: &DrawList, clear: [f64; 4]) -> (u32, u32, Vec<u8>) {
         let (w, h) = (self.config.width, self.config.height);
+        self.upload_quads(list);
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
             size: wgpu::Extent3d {
