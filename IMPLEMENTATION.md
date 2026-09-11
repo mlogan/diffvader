@@ -36,6 +36,7 @@ src/gpu.rs    wgpu device/surface/pipeline, per-frame quad upload + draw
 src/theme.rs  color palettes
 src/files.rs  file-set discovery (two files, or two directory trees from git dir-diff)
 src/fuzzy.rs  quick-open fuzzy matcher
+src/git.rs    native git mode: `git diff --raw` file list + `git cat-file --batch` blobs
 src/keys.rs   vi key state machine -> Actions
 src/app.rs    winit handler: layout, scrolling, draw-list construction, status bar
 ```
@@ -58,8 +59,9 @@ src/app.rs    winit handler: layout, scrolling, draw-list construction, status b
 - [x] ⌘P quick-open (fuzzy, MRU-first on empty query, ⌘P again cycles), `]f`/`[f`
 - [x] j/k move between changes; whole current change highlighted
 - [x] real scrollbar: track, thumb, change ticks, click-to-jump, drag
-- [x] `diffvader --git ...` re-executes via `git difftool -d --extcmd`; own options are
-      forwarded through `DIFFVADER_OPTS` because git execs the extcmd without a shell
+- [x] `diffvader --git ...` talks to git directly (git.rs). The earlier re-exec through
+      `git difftool -d` cost 250-400 ms of temp-tree writing for 341 files plus a second
+      process; native mode hides all git work behind AppKit startup (2026-09-11)
 
 ## Measurements (2026-09-10, Mac Studio, macOS 26)
 
@@ -68,6 +70,10 @@ sharedApplication` ~40, `[NSApp run]` -> `resumed` ~25, first titled NSWindow ~4
 GPU surface + first frame ~3. A bare Objective-C program hits the same floor (~130 ms).
 Target (2026-09-10): sub-200 ms cold start, which this meets with margin. Borderless
 windows init in ~17 ms instead of ~40 ms (measured) if more is ever needed.
+
+Exit latency: from a key/user event to `exiting()` is ~15 ms and process teardown is
+immediate. (`--quit-after-first-frame` exits from `resumed`, before the run loop is fully
+up, which adds ~85 ms; that is a benchmark artifact, not something users see.)
 
 Note for headless testing: when the screen is locked, `NSWindow.occlusionState` never
 reports visible and wgpu skips presenting. `--screenshot` and `--bench-scroll` render

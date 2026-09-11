@@ -1,5 +1,5 @@
-//! The set of file pairs in a session: either the two files given on the command line or,
-//! for `git difftool --dir-diff` style invocations, every file under two directory trees.
+//! The set of file pairs in a session: the two files given on the command line, every
+//! file under two directory trees (`git difftool --dir-diff`), or the output of `git diff`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -23,23 +23,34 @@ impl Status {
     }
 }
 
+/// Where one side of a pair comes from.
+#[derive(Clone, Debug)]
+pub enum Source {
+    /// Missing on this side (added / deleted file).
+    Empty,
+    Path(PathBuf),
+    /// A git blob, read through `git cat-file`.
+    Blob(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct FileEntry {
-    /// Path shown to the user: relative to the trees in directory mode, else as given.
+    /// Path shown to the user: repo- or tree-relative in multi-file modes, else as given.
     pub rel: String,
-    pub left: Option<PathBuf>,
-    pub right: Option<PathBuf>,
+    pub left: Source,
+    pub right: Source,
     pub status: Status,
 }
 
 pub struct FileSet {
     pub entries: Vec<FileEntry>,
-    /// True when the arguments were directories; affects how titles are shown.
-    pub dir_mode: bool,
+    /// The session is a set of files (directory trees or git), not a single pair; the
+    /// header then shows the current path and position instead of the two titles.
+    pub multi: bool,
 }
 
-/// Builds the file set. Two directories are walked and paired by relative path; anything
-/// else is a single pair (missing files, including `/dev/null`, count as empty).
+/// Builds the file set for two paths. Two directories are walked and paired by relative
+/// path; anything else is a single pair (missing files, including `/dev/null`, are empty).
 pub fn discover(left: &Path, right: &Path, titles: (String, String)) -> Result<FileSet, String> {
     let _s = trace::span("discover-files");
     if left.is_dir() && right.is_dir() {
@@ -62,10 +73,14 @@ pub fn discover(left: &Path, right: &Path, titles: (String, String)) -> Result<F
                 (None, Some(_)) => Status::Added,
                 (None, None) => unreachable!(),
             };
+            let src = |p: Option<&PathBuf>| match p {
+                Some(p) => Source::Path(p.clone()),
+                None => Source::Empty,
+            };
             entries.push(FileEntry {
                 rel: rel.clone(),
-                left: lp.cloned(),
-                right: rp.cloned(),
+                left: src(lp),
+                right: src(rp),
                 status,
             });
         }
@@ -74,7 +89,7 @@ pub fn discover(left: &Path, right: &Path, titles: (String, String)) -> Result<F
         }
         return Ok(FileSet {
             entries,
-            dir_mode: true,
+            multi: true,
         });
     }
     let exists = |p: &Path| p != Path::new("/dev/null") && p.exists();
@@ -87,14 +102,21 @@ pub fn discover(left: &Path, right: &Path, titles: (String, String)) -> Result<F
     // In single-file mode the "rel" name is the right-hand title (the newer side), which is
     // what git's $MERGED refers to.
     let rel = if re || !le { titles.1 } else { titles.0 };
+    let src = |ok: bool, p: &Path| {
+        if ok {
+            Source::Path(p.to_path_buf())
+        } else {
+            Source::Empty
+        }
+    };
     Ok(FileSet {
         entries: vec![FileEntry {
             rel,
-            left: le.then(|| left.to_path_buf()),
-            right: re.then(|| right.to_path_buf()),
+            left: src(le, left),
+            right: src(re, right),
             status,
         }],
-        dir_mode: false,
+        multi: false,
     })
 }
 
@@ -174,7 +196,8 @@ mod tests {
                 ("sub/mod.rs".to_string(), Status::Modified),
             ]
         );
-        assert!(set.dir_mode);
+        assert!(set.multi);
+        assert!(matches!(set.entries[0].right, Source::Empty));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

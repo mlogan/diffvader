@@ -3,6 +3,7 @@ mod diff;
 mod files;
 mod font;
 mod fuzzy;
+mod git;
 mod gpu;
 mod keys;
 mod text;
@@ -16,16 +17,16 @@ use std::sync::{mpsc, Arc};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
-use crate::app::{App, Loaded, Msg, Options};
+use crate::app::{App, Input, Loaded, Msg, Options};
 use crate::diff::WhitespaceMode;
-use crate::files::FileEntry;
+use crate::files::{FileEntry, FileSet, Source};
 use crate::text::FileData;
 
 const USAGE: &str = "\
 diffvader — fast side-by-side diff viewer
 
 usage: diffvader [options] LEFT RIGHT [+ROW]     compare two files, or two directory trees
-       diffvader [options] [--git GIT-DIFF-ARGS]  run `git difftool -d` with diffvader
+       diffvader [options] [--git GIT-DIFF-ARGS]  show what `git diff GIT-DIFF-ARGS` would
 
 options:
   -w, --ignore-all-space       ignore all whitespace
@@ -45,16 +46,17 @@ options:
   -h, --help                   show this help
   -V, --version                show version
 
-With two directories (what `git difftool --dir-diff` passes) every differing file is
-loaded and shown one at a time; ⌘P opens a fuzzy file picker. Press ? inside the app
-for the full key list.
+`--git` (or no arguments inside a repository) reads the changed-file list and contents
+straight from git, so any `git diff` arguments work: `diffvader --git HEAD~3`,
+`diffvader --git --cached`, `diffvader --git main.. -- src/`. Two directories (what
+`git difftool --dir-diff` passes) work the same way. Files are shown one at a time; ⌘P
+opens a fuzzy file picker. Press ? inside the app for the full key list.
 ";
 
 fn main() {
     trace::init();
     let opts = match parse_args() {
-        Ok(Parsed::Run(o)) => o,
-        Ok(Parsed::Git(args, own)) => run_git_difftool(args, own),
+        Ok(o) => o,
         Err(e) => {
             eprintln!("diffvader: {e}\n\n{USAGE}");
             std::process::exit(2);
@@ -81,8 +83,7 @@ fn main() {
     {
         let tx = tx.clone();
         let wanted = wanted.clone();
-        let left = opts.left.clone();
-        let right = opts.right.clone();
+        let input = opts.input.clone();
         let titles = (opts.left_title.clone(), opts.right_title.clone());
         let mode = opts.whitespace;
         std::thread::Builder::new()
@@ -99,7 +100,20 @@ fn main() {
                         let _ = p.send_event(());
                     }
                 };
-                let set = match files::discover(&left, &right, titles) {
+                let mut blobs = None;
+                let discovered = match &input {
+                    Input::Pair(left, right) => {
+                        files::discover(left.as_path(), right.as_path(), titles)
+                    }
+                    Input::Git(args) => git::discover(args.as_slice()).map(|(entries, reader)| {
+                        blobs = Some(reader);
+                        FileSet {
+                            entries,
+                            multi: true,
+                        }
+                    }),
+                };
+                let set = match discovered {
                     Ok(set) => set,
                     Err(e) => {
                         notify(Msg::Files(Err(e)));
@@ -118,7 +132,7 @@ fn main() {
                     } else {
                         done.iter().position(|d| !d).unwrap()
                     };
-                    let result = load_pair(&entries[i], mode);
+                    let result = load_pair(&entries[i], mode, &mut blobs);
                     done[i] = true;
                     notify(Msg::Loaded { file: i, result });
                 }
@@ -165,12 +179,21 @@ fn main() {
     }
 }
 
-fn load_pair(entry: &FileEntry, mode: WhitespaceMode) -> Result<Loaded, String> {
+fn load_pair(
+    entry: &FileEntry,
+    mode: WhitespaceMode,
+    blobs: &mut Option<git::BlobReader>,
+) -> Result<Loaded, String> {
     let _s = trace::span("load-pair");
-    let load = |p: &Option<PathBuf>| -> Result<FileData, String> {
-        match p {
-            Some(p) => FileData::load(p).map_err(|e| format!("{}: {e}", p.display())),
-            None => Ok(FileData::empty()),
+    let mut load = |src: &Source| -> Result<FileData, String> {
+        match src {
+            Source::Empty => Ok(FileData::empty()),
+            Source::Path(p) => FileData::load(p).map_err(|e| format!("{}: {e}", p.display())),
+            Source::Blob(sha) => {
+                let reader = blobs.as_mut().ok_or("no git blob reader")?;
+                let bytes = reader.read(sha)?;
+                Ok(FileData::from_bytes(text::Bytes::Owned(bytes)))
+            }
         }
     };
     let a = load(&entry.left)?;
@@ -186,28 +209,8 @@ fn load_pair(entry: &FileEntry, mode: WhitespaceMode) -> Result<Loaded, String> 
     })
 }
 
-enum Parsed {
-    Run(Options),
-    /// Delegate to `git difftool -d` with these extra arguments; the second list holds our
-    /// own options to forward to the child process.
-    Git(Vec<String>, Vec<String>),
-}
-
-/// Options given before `--git` reach the re-executed child through this variable, because
-/// `git difftool --dir-diff --extcmd` runs the command without shell parsing.
-const OPTS_ENV: &str = "DIFFVADER_OPTS";
-
-fn parse_args() -> Result<Parsed, String> {
-    let inherited: Vec<String> = std::env::var(OPTS_ENV)
-        .map(|v| {
-            v.split('\x1f')
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut args = inherited.into_iter().chain(std::env::args().skip(1));
-    let mut passthrough: Vec<String> = Vec::new();
+fn parse_args() -> Result<Options, String> {
+    let mut args = std::env::args().skip(1);
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut font = None;
     let mut font_pt = 13.0f32;
@@ -222,12 +225,7 @@ fn parse_args() -> Result<Parsed, String> {
     let mut start_row = None;
     let mut git_args: Option<Vec<String>> = None;
     while let Some(a) = args.next() {
-        passthrough.push(a.clone());
-        let mut value = |name: &str| {
-            let v = args.next().ok_or_else(|| format!("{name} needs a value"))?;
-            passthrough.push(v.clone());
-            Ok::<String, String>(v)
-        };
+        let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -246,7 +244,6 @@ fn parse_args() -> Result<Parsed, String> {
                 std::process::exit(0);
             }
             "--git" => {
-                passthrough.pop();
                 git_args = Some(args.by_ref().collect());
                 break;
             }
@@ -284,24 +281,29 @@ fn parse_args() -> Result<Parsed, String> {
             _ => paths.push(PathBuf::from(a)),
         }
     }
-    if let Some(git) = git_args {
-        if !paths.is_empty() {
+    let git_args = match git_args {
+        Some(g) if !paths.is_empty() => {
+            let _ = g;
             return Err("--git cannot be combined with file arguments".into());
         }
-        return Ok(Parsed::Git(git, passthrough));
-    }
-    if paths.is_empty() {
-        return Ok(Parsed::Git(Vec::new(), passthrough));
-    }
-    if paths.len() != 2 {
-        return Err("expected exactly two files or directories".into());
-    }
-    let right = paths.pop().unwrap();
-    let left = paths.pop().unwrap();
-    let (left_title, right_title) = titles(&left, &right);
-    Ok(Parsed::Run(Options {
-        left,
-        right,
+        Some(g) => Some(g),
+        None if paths.is_empty() => Some(Vec::new()),
+        None => None,
+    };
+    let (input, left_title, right_title) = match git_args {
+        Some(g) => (Input::Git(g), String::new(), String::new()),
+        None => {
+            if paths.len() != 2 {
+                return Err("expected exactly two files or directories".into());
+            }
+            let right = paths.pop().unwrap();
+            let left = paths.pop().unwrap();
+            let (lt, rt) = titles(&left, &right);
+            (Input::Pair(left, right), lt, rt)
+        }
+    };
+    Ok(Options {
+        input,
         left_title,
         right_title,
         font,
@@ -315,27 +317,7 @@ fn parse_args() -> Result<Parsed, String> {
         quit_after_first_frame,
         bench_scroll,
         start_row,
-    }))
-}
-
-/// Re-executes through `git difftool --dir-diff` so git prepares both trees and calls us
-/// back with two directories. Never returns.
-fn run_git_difftool(args: Vec<String>, own: Vec<String>) -> ! {
-    let status = std::process::Command::new("git")
-        .env(OPTS_ENV, own.join("\x1f"))
-        .arg("difftool")
-        .arg("--dir-diff")
-        .arg("--no-prompt")
-        .arg(format!("--extcmd={}", exe_path()))
-        .args(&args)
-        .status();
-    match status {
-        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
-        Err(e) => {
-            eprintln!("diffvader: cannot run git: {e}");
-            std::process::exit(1);
-        }
-    }
+    })
 }
 
 /// Display names for the panes. `git difftool` hands us temp files and puts the real
@@ -370,7 +352,7 @@ fn exe_path() -> String {
 fn git_config_snippet() -> String {
     let exe = exe_path();
     format!(
-        "[diff]\n\ttool = diffvader\n[difftool]\n\tprompt = false\n[difftool \"diffvader\"]\n\tcmd = {exe} \"$LOCAL\" \"$REMOTE\"\n\n# then: git difftool -d [<commit>...]   (or just: diffvader --git [<commit>...])\n"
+        "[diff]\n\ttool = diffvader\n[difftool]\n\tprompt = false\n[difftool \"diffvader\"]\n\tcmd = {exe} \"$LOCAL\" \"$REMOTE\"\n\n# then: git difftool [<commit>...]    (or, without config: diffvader --git [<commit>...])\n"
     )
 }
 
@@ -400,5 +382,5 @@ fn install_git() {
             }
         }
     }
-    println!("done. run `git difftool -d` (or `diffvader --git HEAD~1`) to use it.");
+    println!("done. run `git difftool` (or `diffvader --git HEAD~1`) to use it.");
 }

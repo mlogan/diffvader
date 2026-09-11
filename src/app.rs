@@ -24,9 +24,15 @@ use crate::text::FileData;
 use crate::theme::{self, Theme};
 use crate::trace;
 
+#[derive(Clone, Debug)]
+pub enum Input {
+    Pair(PathBuf, PathBuf),
+    /// Arguments for `git diff`.
+    Git(Vec<String>),
+}
+
 pub struct Options {
-    pub left: PathBuf,
-    pub right: PathBuf,
+    pub input: Input,
     pub left_title: String,
     pub right_title: String,
     pub font: Option<PathBuf>,
@@ -979,7 +985,7 @@ impl App {
             match msg {
                 Msg::Files(Ok(set)) => {
                     trace::mark("files-received");
-                    self.dir_mode = set.dir_mode;
+                    self.dir_mode = set.multi;
                     self.files = set
                         .entries
                         .into_iter()
@@ -1221,6 +1227,7 @@ impl App {
     }
 
     fn finish(&mut self) {
+        trace::mark("exiting");
         if let Some(p) = &self.opts.trace_path {
             match trace::write_chrome_trace(p) {
                 Ok(()) => eprintln!("diffvader: wrote trace to {p}"),
@@ -1229,6 +1236,10 @@ impl App {
         }
         if self.opts.timing {
             trace::print_summary();
+            eprintln!(
+                "diffvader: exiting at {:.1} ms after process start",
+                trace::elapsed_us() as f64 / 1000.0
+            );
         }
     }
 }
