@@ -120,5 +120,7 @@ percentiles at exit.
 
 ## Development
 
-See `IMPLEMENTATION.md` for the architecture and status. `cargo test` covers the diff
+See `IMPLEMENTATION.md` for the architecture and status. The Dock icon is
+`assets/icon.png`; regenerate it with `python3 assets/icon.py assets/icon.png` after
+editing the generator. `cargo test` covers the diff
 engine, line indexing and the vi key state machine.
