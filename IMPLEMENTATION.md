@@ -110,6 +110,31 @@ diff frame. `DIFFVADER_EXIT_AFTER_MS=N` exits cleanly (writing traces) after N m
   ours to fix; `-d` and `git dv` avoid it entirely.
 - Dock icon install is 12 ms on the main thread after the first presented frame.
 
+## AI explanations (in progress, 2026-09-11)
+
+Ask an AI agent CLI to explain the purpose of one change. Branch `mlogan-explain-hunk`.
+
+Design:
+- `src/explain.rs`: agent discovery (`claude`, `codex`, `gemini` on PATH, or `--agent` /
+  `DIFFVADER_AGENT`), prompt construction, the subprocess run on a worker thread, word wrap.
+- Keys: `e` explains the change under the cursor, else the first unexplained change in
+  view; `E` expands the current explanation by a little. `:explain` / `:expand` too. A
+  `?` glyph in the left gutter on each change's first row is clickable and does the same.
+- First pass uses the agent's fastest model (`claude --model haiku`); expansions use the
+  agent's default model. Each expansion re-sends the previous text and asks for slightly
+  more.
+- Explanations show in a panel above the status bar for the change under the cursor.
+  Layout shrinks the text area; the view is nudged so the cursor stays visible.
+- Notes are keyed by the hunk's first (left, right) line pair so they survive re-diffs.
+- Agent children are tracked and killed on exit; runs time out after 3 minutes.
+
+Progress:
+- [ ] explain.rs: discovery, prompt, excerpt, runner, wrap (+ tests)
+- [ ] app.rs: state, actions, panel, gutter icon, click
+- [ ] keys.rs / main.rs / files.rs / git.rs wiring
+- [ ] docs: USAGE.md, README, help overlay
+- [ ] tested end to end with claude
+
 ## Remaining / ideas
 
 - Borderless window with custom title bar (~22 ms faster cold start; not needed for the 200 ms target)
