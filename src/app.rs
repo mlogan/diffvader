@@ -894,6 +894,17 @@ impl App {
                     p.selected = (p.selected + n - 1) % n;
                 }
             }
+            // Page keys move a screenful and clamp at the ends, like VS Code's list.
+            Key::Named(NamedKey::PageDown) => {
+                if n > 0 {
+                    p.selected = (p.selected + PICKER_ROWS - 1).min(n - 1);
+                }
+            }
+            Key::Named(NamedKey::PageUp) => {
+                p.selected = p.selected.saturating_sub(PICKER_ROWS - 1);
+            }
+            Key::Named(NamedKey::Home) => p.selected = 0,
+            Key::Named(NamedKey::End) => p.selected = n.saturating_sub(1),
             Key::Named(NamedKey::Backspace) => {
                 if p.query.pop().is_some() {
                     self.fill_picker(&mut p);

@@ -43,8 +43,8 @@ nothing is written to disk and the git work overlaps window creation. Two direct
 (what `git difftool --dir-diff` passes) work the same way. Files are loaded in the
 background, the one on screen first, and shown one at a time. The header shows the
 current file, its position in the set and its line counts. `⌘P` opens a VS Code style
-quick-open: type to fuzzy-filter, `↑`/`↓` or `^p`/`^n` to move, `Enter` to open, `Esc` to
-close; with an empty query the list is in most-recently-viewed order, so `⌘P Enter` flips
+quick-open: type to fuzzy-filter, `↑`/`↓` or `^p`/`^n` to move, `PgUp`/`PgDn`/`Home`/`End`
+to move by screenfuls, `Enter` to open, `Esc` to close; with an empty query the list is in most-recently-viewed order, so `⌘P Enter` flips
 back to the previous file. `]f` / `[f` step through files in order.
 
 `DIFFVADER_TIMING=1` and `DIFFVADER_TRACE=file.json` are equivalent to the flags, which is
