@@ -45,11 +45,15 @@ pub fn invocation(local: &Path, remote: &Path, base: Option<&str>) -> Result<Out
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     } else if !dir.is_dir() || viewer_dead(&dir) {
-        // The viewer quit (it removes its session directory on a clean exit) or died.
-        // Exiting with a signal-like status makes git-difftool--helper stop instead of
-        // spending ~65 ms on each remaining file; git reports "external diff died".
+        // The viewer quit (it removes its session directory on a clean exit) or died, so
+        // the remaining ~100 ms per file would be wasted. End the run the way Ctrl-C does:
+        // SIGINT to git difftool's process group (ours). git treats SIGINT as a quiet
+        // interruption and the shell prints nothing, unlike a non-zero helper exit, which
+        // makes git report "fatal: external diff died".
         let _ = std::fs::remove_dir_all(&dir);
-        eprintln!("diffvader: viewer closed, stopping git difftool");
+        unsafe {
+            libc::kill(0, libc::SIGINT);
+        }
         std::process::exit(130);
     }
 

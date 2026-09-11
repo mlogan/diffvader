@@ -82,7 +82,9 @@ Quitting: ⌘Q/⌘W are handled as keys and the default menu is disabled on purp
 trips winit 0.30's "tried to handle event while another event is currently being handled"
 panic; with `panic = "abort"` that skipped every cleanup and left `git difftool` sessions
 grinding through remaining files. Cleanup also runs from an `atexit` hook, and per-file
-invocations check the viewer's pid so a dead viewer stops git within one file.
+invocations check the viewer's pid; once it is gone they SIGINT git difftool's process
+group (what Ctrl-C does), which git and the shell treat as a quiet interruption, so the
+prompt returns within one file and nothing is printed.
 
 Exit latency: from a key/user event to `exiting()` is ~15 ms and process teardown is
 immediate. (`--quit-after-first-frame` exits from `resumed`, before the run loop is fully
