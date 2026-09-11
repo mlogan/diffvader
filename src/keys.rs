@@ -25,6 +25,9 @@ pub enum Action {
     PrevHunk(u64),
     FirstHunk,
     LastHunk,
+    NextFile(u64),
+    PrevFile(u64),
+    OpenPicker,
     ScrollCols(i64),
     ColsHome,
     ColsEnd,
@@ -129,6 +132,7 @@ impl Vi {
                     "=" | "+" => Some(Action::ZoomIn),
                     "-" => Some(Action::ZoomOut),
                     "0" => Some(Action::ZoomReset),
+                    "p" => Some(Action::OpenPicker),
                     _ => None,
                 };
             }
@@ -142,8 +146,8 @@ impl Vi {
                 Some('b') => Action::Page(-self.count_signed(1)),
                 Some('e') => Action::ScrollLines(self.count_signed(1)),
                 Some('y') => Action::ScrollLines(-self.count_signed(1)),
-                Some('n') => Action::MoveCursor(self.count_signed(1)),
-                Some('p') => Action::MoveCursor(-self.count_signed(1)),
+                Some('n') => Action::NextHunk(self.take_count()),
+                Some('p') => Action::PrevHunk(self.take_count()),
                 _ => {
                     self.reset();
                     return None;
@@ -189,6 +193,7 @@ impl Vi {
                 return match ch {
                     Some('c') => Some(Action::PrevHunk(n)),
                     Some('C') => Some(Action::FirstHunk),
+                    Some('f') => Some(Action::PrevFile(n)),
                     _ => None,
                 };
             }
@@ -198,6 +203,7 @@ impl Vi {
                 return match ch {
                     Some('c') => Some(Action::NextHunk(n)),
                     Some('C') => Some(Action::LastHunk),
+                    Some('f') => Some(Action::NextFile(n)),
                     _ => None,
                 };
             }
@@ -236,8 +242,8 @@ impl Vi {
             return None;
         }
         let a = match c {
-            'j' => Action::MoveCursor(self.count_signed(1)),
-            'k' => Action::MoveCursor(-self.count_signed(1)),
+            'j' => Action::NextHunk(self.take_count()),
+            'k' => Action::PrevHunk(self.take_count()),
             'h' => Action::ScrollCols(-self.count_signed(4)),
             'l' => Action::ScrollCols(self.count_signed(4)),
             '0' | '^' => Action::ColsHome,
@@ -369,6 +375,9 @@ fn run_command(cmd: &str) -> Action {
             other => Action::Message(format!("unknown option: {other}")),
         },
         "h" | "help" => Action::ToggleHelp,
+        "n" | "next" => Action::NextFile(1),
+        "N" | "prev" | "previous" => Action::PrevFile(1),
+        "e" | "edit" | "files" | "f" => Action::OpenPicker,
         _ => Action::Message(format!("not a command: {cmd}")),
     }
 }
@@ -399,10 +408,16 @@ mod tests {
     #[test]
     fn counts_and_motions() {
         let mut vi = Vi::new();
-        assert_eq!(press(&mut vi, 'j'), Some(Action::MoveCursor(1)));
+        assert_eq!(press(&mut vi, 'j'), Some(Action::NextHunk(1)));
         assert_eq!(press(&mut vi, '1'), None);
         assert_eq!(press(&mut vi, '0'), None);
-        assert_eq!(press(&mut vi, 'k'), Some(Action::MoveCursor(-10)));
+        assert_eq!(press(&mut vi, 'k'), Some(Action::PrevHunk(10)));
+        assert_eq!(
+            named(&mut vi, NamedKey::ArrowDown),
+            Some(Action::MoveCursor(1))
+        );
+        assert_eq!(press(&mut vi, ']'), None);
+        assert_eq!(press(&mut vi, 'f'), Some(Action::NextFile(1)));
         assert_eq!(press(&mut vi, '0'), Some(Action::ColsHome));
         assert_eq!(press(&mut vi, 'g'), None);
         assert_eq!(press(&mut vi, 'g'), Some(Action::GoTop));

@@ -1,6 +1,8 @@
 mod app;
 mod diff;
+mod files;
 mod font;
+mod fuzzy;
 mod gpu;
 mod keys;
 mod text;
@@ -8,6 +10,7 @@ mod theme;
 mod trace;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -15,12 +18,14 @@ use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
 use crate::app::{App, Loaded, Msg, Options};
 use crate::diff::WhitespaceMode;
+use crate::files::FileEntry;
 use crate::text::FileData;
 
 const USAGE: &str = "\
 diffvader — fast side-by-side diff viewer
 
-usage: diffvader [options] LEFT RIGHT [+ROW]
+usage: diffvader [options] LEFT RIGHT [+ROW]     compare two files, or two directory trees
+       diffvader [options] [--git GIT-DIFF-ARGS]  run `git difftool -d` with diffvader
 
 options:
   -w, --ignore-all-space       ignore all whitespace
@@ -40,13 +45,16 @@ options:
   -h, --help                   show this help
   -V, --version                show version
 
-keys: press ? inside the app.
+With two directories (what `git difftool --dir-diff` passes) every differing file is
+loaded and shown one at a time; ⌘P opens a fuzzy file picker. Press ? inside the app
+for the full key list.
 ";
 
 fn main() {
     trace::init();
     let opts = match parse_args() {
-        Ok(o) => o,
+        Ok(Parsed::Run(o)) => o,
+        Ok(Parsed::Git(args, own)) => run_git_difftool(args, own),
         Err(e) => {
             eprintln!("diffvader: {e}\n\n{USAGE}");
             std::process::exit(2);
@@ -66,36 +74,53 @@ fn main() {
         .expect("spawn gpu thread");
 
     let (tx, rx) = mpsc::channel::<Msg>();
+    let wanted = Arc::new(AtomicUsize::new(0));
     // The loader starts before the event loop exists; it gets the proxy (to wake the loop)
     // through this side channel once the loop has been created.
-    let (proxy_tx, proxy_rx) = mpsc::channel();
+    let (proxy_tx, proxy_rx) = mpsc::channel::<winit::event_loop::EventLoopProxy<()>>();
     {
         let tx = tx.clone();
+        let wanted = wanted.clone();
         let left = opts.left.clone();
         let right = opts.right.clone();
+        let titles = (opts.left_title.clone(), opts.right_title.clone());
         let mode = opts.whitespace;
         std::thread::Builder::new()
             .name("loader".into())
             .spawn(move || {
                 let _s = trace::span("load-and-diff");
-                let result = (|| {
-                    let a = load(&left)?;
-                    let b = load(&right)?;
-                    if a.binary || b.binary {
-                        return Err("binary files differ".to_string());
+                let mut proxy = None;
+                let mut notify = |msg: Msg| {
+                    let _ = tx.send(msg);
+                    if proxy.is_none() {
+                        proxy = proxy_rx.recv().ok();
                     }
-                    let d = diff::diff_files(&a, &b, mode);
-                    Ok::<_, String>(Loaded {
-                        left: Arc::new(a),
-                        right: Arc::new(b),
-                        diff: d,
-                    })
-                })();
-                let _ = tx.send(Msg::Loaded(result));
-                drop(_s);
-                if let Ok(proxy) = proxy_rx.recv() {
-                    let proxy: winit::event_loop::EventLoopProxy<()> = proxy;
-                    let _ = proxy.send_event(());
+                    if let Some(p) = &proxy {
+                        let _ = p.send_event(());
+                    }
+                };
+                let set = match files::discover(&left, &right, titles) {
+                    Ok(set) => set,
+                    Err(e) => {
+                        notify(Msg::Files(Err(e)));
+                        return;
+                    }
+                };
+                let entries: Vec<FileEntry> = set.entries.clone();
+                notify(Msg::Files(Ok(set)));
+                // Load the file the UI wants first, then the rest in order.
+                let n = entries.len();
+                let mut done = vec![false; n];
+                for _ in 0..n {
+                    let w = wanted.load(Ordering::Relaxed);
+                    let i = if w < n && !done[w] {
+                        w
+                    } else {
+                        done.iter().position(|d| !d).unwrap()
+                    };
+                    let result = load_pair(&entries[i], mode);
+                    done[i] = true;
+                    notify(Msg::Loaded { file: i, result });
                 }
             })
             .expect("spawn loader thread");
@@ -114,7 +139,7 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let _ = proxy_tx.send(proxy.clone());
 
-    let mut app = match App::new(opts, rx, tx, proxy.clone(), font_thread, gpu_thread) {
+    let mut app = match App::new(opts, rx, tx, proxy.clone(), wanted, font_thread, gpu_thread) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("diffvader: {e}");
@@ -140,15 +165,49 @@ fn main() {
     }
 }
 
-fn load(path: &Path) -> Result<FileData, String> {
-    if path == Path::new("/dev/null") || !path.exists() {
-        return Ok(FileData::empty());
+fn load_pair(entry: &FileEntry, mode: WhitespaceMode) -> Result<Loaded, String> {
+    let _s = trace::span("load-pair");
+    let load = |p: &Option<PathBuf>| -> Result<FileData, String> {
+        match p {
+            Some(p) => FileData::load(p).map_err(|e| format!("{}: {e}", p.display())),
+            None => Ok(FileData::empty()),
+        }
+    };
+    let a = load(&entry.left)?;
+    let b = load(&entry.right)?;
+    if a.binary || b.binary {
+        return Err("binary files differ".to_string());
     }
-    FileData::load(path).map_err(|e| format!("{}: {e}", path.display()))
+    let d = diff::diff_files(&a, &b, mode);
+    Ok(Loaded {
+        left: Arc::new(a),
+        right: Arc::new(b),
+        diff: d,
+    })
 }
 
-fn parse_args() -> Result<Options, String> {
-    let mut args = std::env::args().skip(1);
+enum Parsed {
+    Run(Options),
+    /// Delegate to `git difftool -d` with these extra arguments; the second list holds our
+    /// own options to forward to the child process.
+    Git(Vec<String>, Vec<String>),
+}
+
+/// Options given before `--git` reach the re-executed child through this variable, because
+/// `git difftool --dir-diff --extcmd` runs the command without shell parsing.
+const OPTS_ENV: &str = "DIFFVADER_OPTS";
+
+fn parse_args() -> Result<Parsed, String> {
+    let inherited: Vec<String> = std::env::var(OPTS_ENV)
+        .map(|v| {
+            v.split('\x1f')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut args = inherited.into_iter().chain(std::env::args().skip(1));
+    let mut passthrough: Vec<String> = Vec::new();
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut font = None;
     let mut font_pt = 13.0f32;
@@ -161,8 +220,14 @@ fn parse_args() -> Result<Options, String> {
     let mut quit_after_first_frame = false;
     let mut bench_scroll = None;
     let mut start_row = None;
+    let mut git_args: Option<Vec<String>> = None;
     while let Some(a) = args.next() {
-        let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
+        passthrough.push(a.clone());
+        let mut value = |name: &str| {
+            let v = args.next().ok_or_else(|| format!("{name} needs a value"))?;
+            passthrough.push(v.clone());
+            Ok::<String, String>(v)
+        };
         match a.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -179,6 +244,11 @@ fn parse_args() -> Result<Options, String> {
             "--install-git" => {
                 install_git();
                 std::process::exit(0);
+            }
+            "--git" => {
+                passthrough.pop();
+                git_args = Some(args.by_ref().collect());
+                break;
             }
             "-w" | "--ignore-all-space" => whitespace = WhitespaceMode::IgnoreAll,
             "-b" | "--ignore-space-change" => whitespace = WhitespaceMode::IgnoreChange,
@@ -214,13 +284,22 @@ fn parse_args() -> Result<Options, String> {
             _ => paths.push(PathBuf::from(a)),
         }
     }
+    if let Some(git) = git_args {
+        if !paths.is_empty() {
+            return Err("--git cannot be combined with file arguments".into());
+        }
+        return Ok(Parsed::Git(git, passthrough));
+    }
+    if paths.is_empty() {
+        return Ok(Parsed::Git(Vec::new(), passthrough));
+    }
     if paths.len() != 2 {
-        return Err("expected exactly two files".into());
+        return Err("expected exactly two files or directories".into());
     }
     let right = paths.pop().unwrap();
     let left = paths.pop().unwrap();
     let (left_title, right_title) = titles(&left, &right);
-    Ok(Options {
+    Ok(Parsed::Run(Options {
         left,
         right,
         left_title,
@@ -236,7 +315,27 @@ fn parse_args() -> Result<Options, String> {
         quit_after_first_frame,
         bench_scroll,
         start_row,
-    })
+    }))
+}
+
+/// Re-executes through `git difftool --dir-diff` so git prepares both trees and calls us
+/// back with two directories. Never returns.
+fn run_git_difftool(args: Vec<String>, own: Vec<String>) -> ! {
+    let status = std::process::Command::new("git")
+        .env(OPTS_ENV, own.join("\x1f"))
+        .arg("difftool")
+        .arg("--dir-diff")
+        .arg("--no-prompt")
+        .arg(format!("--extcmd={}", exe_path()))
+        .args(&args)
+        .status();
+    match status {
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!("diffvader: cannot run git: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Display names for the panes. `git difftool` hands us temp files and puts the real
@@ -271,7 +370,7 @@ fn exe_path() -> String {
 fn git_config_snippet() -> String {
     let exe = exe_path();
     format!(
-        "[diff]\n\ttool = diffvader\n[difftool]\n\tprompt = false\n[difftool \"diffvader\"]\n\tcmd = {exe} \"$LOCAL\" \"$REMOTE\"\n"
+        "[diff]\n\ttool = diffvader\n[difftool]\n\tprompt = false\n[difftool \"diffvader\"]\n\tcmd = {exe} \"$LOCAL\" \"$REMOTE\"\n\n# then: git difftool -d [<commit>...]   (or just: diffvader --git [<commit>...])\n"
     )
 }
 
@@ -301,5 +400,5 @@ fn install_git() {
             }
         }
     }
-    println!("done. run `git difftool` (or `git difftool HEAD~1`) to use it.");
+    println!("done. run `git difftool -d` (or `diffvader --git HEAD~1`) to use it.");
 }

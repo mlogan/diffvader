@@ -3,18 +3,21 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::diff::{self, DiffResult, IntraDiff, Row, RowKind, WhitespaceMode, NONE};
+use crate::files::{FileEntry, FileSet, Status};
 use crate::font::{Atlas, FontSet};
+use crate::fuzzy;
 use crate::gpu::{DrawList, Gpu, GpuCore, SurfaceProblem};
 use crate::keys::{Action, KeyInput, Vi};
 use crate::text::FileData;
@@ -48,8 +51,16 @@ pub struct Loaded {
 }
 
 pub enum Msg {
-    Loaded(Result<Loaded, String>),
-    Rediff(DiffResult),
+    /// The file set, sent once before any `Loaded`.
+    Files(Result<FileSet, String>),
+    Loaded {
+        file: usize,
+        result: Result<Loaded, String>,
+    },
+    Rediff {
+        file: usize,
+        diff: DiffResult,
+    },
 }
 
 enum State {
@@ -58,6 +69,37 @@ enum State {
     Failed(String),
 }
 
+/// Per-file view position, kept while another file is shown.
+#[derive(Clone, Copy, Default)]
+struct View {
+    scroll_y: f64,
+    scroll_x: f64,
+    cursor: usize,
+    /// The initial landing (first change / `+ROW`) has been done.
+    landed: bool,
+}
+
+struct FileSlot {
+    entry: FileEntry,
+    state: State,
+    view: View,
+    stats: Option<(u32, u32)>,
+}
+
+struct PickResult {
+    file: usize,
+    positions: Vec<u32>,
+}
+
+/// Quick-open overlay state.
+struct Picker {
+    query: String,
+    selected: usize,
+    scroll: usize,
+    results: Vec<PickResult>,
+}
+
+const PICKER_ROWS: usize = 14;
 const SCROLLOFF: usize = 3;
 
 pub struct App {
@@ -67,6 +109,8 @@ pub struct App {
     rx: mpsc::Receiver<Msg>,
     proxy: EventLoopProxy<()>,
     tx: mpsc::Sender<Msg>,
+    /// Index of the file the loader should load next (see `main.rs`).
+    wanted: Arc<AtomicUsize>,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     gpu_core: Option<std::thread::JoinHandle<Result<GpuCore, String>>>,
@@ -76,7 +120,13 @@ pub struct App {
     font_pt: f32,
     cell_w: f32,
     line_h: f32,
-    state: State,
+    files: Vec<FileSlot>,
+    current: usize,
+    dir_mode: bool,
+    /// Most recently viewed first.
+    mru: Vec<usize>,
+    /// State shown while the file set is unknown or discovery failed.
+    global: State,
     ws_mode: WhitespaceMode,
     /// Pixels; fractional so trackpad scrolling is smooth.
     scroll_y: f64,
@@ -84,7 +134,11 @@ pub struct App {
     scroll_x: f64,
     cursor: usize,
     vi: Vi,
+    picker: Option<Picker>,
     modifiers: ModifiersState,
+    mouse: (f32, f32),
+    /// Scrollbar drag in progress: offset of the grab point from the thumb top.
+    drag: Option<f32>,
     intra_cache: HashMap<u32, Option<IntraDiff>>,
     search: Option<String>,
     draw: DrawList,
@@ -119,6 +173,7 @@ struct Layout {
     pane_x: [f32; 2],
     text_x: [f32; 2],
     cols_visible: i64,
+    scrollbar_x: f32,
     scrollbar_w: f32,
 }
 
@@ -132,6 +187,7 @@ impl App {
         rx: mpsc::Receiver<Msg>,
         tx: mpsc::Sender<Msg>,
         proxy: EventLoopProxy<()>,
+        wanted: Arc<AtomicUsize>,
         fonts: std::thread::JoinHandle<Result<FontSet, String>>,
         gpu_core: std::thread::JoinHandle<Result<GpuCore, String>>,
     ) -> Result<App, String> {
@@ -152,6 +208,7 @@ impl App {
             rx,
             tx,
             proxy,
+            wanted,
             window: None,
             gpu: None,
             gpu_core: Some(gpu_core),
@@ -160,12 +217,19 @@ impl App {
             scale: 2.0,
             cell_w: 1.0,
             line_h: 1.0,
-            state: State::Loading,
+            files: Vec::new(),
+            current: 0,
+            dir_mode: false,
+            mru: Vec::new(),
+            global: State::Loading,
             scroll_y: 0.0,
             scroll_x: 0.0,
             cursor: 0,
             vi: Vi::new(),
+            picker: None,
             modifiers: ModifiersState::empty(),
+            mouse: (0.0, 0.0),
+            drag: None,
             intra_cache: HashMap::new(),
             search: None,
             draw: DrawList::default(),
@@ -198,11 +262,28 @@ impl App {
         );
     }
 
-    fn rows(&self) -> &[Row] {
-        match &self.state {
-            State::Ready(l) => &l.diff.rows,
-            _ => &[],
+    fn state(&self) -> &State {
+        match self.files.get(self.current) {
+            Some(f) => &f.state,
+            None => &self.global,
         }
+    }
+
+    fn loaded(&self) -> Option<&Loaded> {
+        match self.state() {
+            State::Ready(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    fn rows(&self) -> &[Row] {
+        self.loaded().map(|l| l.diff.rows.as_slice()).unwrap_or(&[])
+    }
+
+    fn hunks(&self) -> &[diff::Hunk] {
+        self.loaded()
+            .map(|l| l.diff.hunks.as_slice())
+            .unwrap_or(&[])
     }
 
     fn layout(&self) -> Layout {
@@ -213,15 +294,15 @@ impl App {
         let status_h = (self.line_h + 8.0 * s).round();
         let text_top = header_h;
         let text_h = (h - header_h - status_h).max(0.0);
-        let digits = match &self.state {
-            State::Ready(l) => {
+        let digits = match self.loaded() {
+            Some(l) => {
                 let n = l.left.line_count().max(l.right.line_count()).max(1);
                 (n as f64).log10().floor() as usize + 1
             }
-            _ => 3,
+            None => 3,
         };
         let gutter_w = ((digits + 2) as f32 * self.cell_w + 4.0 * s).round();
-        let scrollbar_w = (10.0 * s).round();
+        let scrollbar_w = (14.0 * s).round();
         let divider_w = (2.0 * s).round();
         let pane_w = ((w - divider_w - scrollbar_w) / 2.0).floor();
         let pane_x = [0.0, pane_w + divider_w];
@@ -244,8 +325,25 @@ impl App {
             pane_x,
             text_x,
             cols_visible: (text_w / self.cell_w).floor() as i64,
+            scrollbar_x: pane_x[1] + pane_w,
             scrollbar_w,
         }
+    }
+
+    /// Thumb top and height in pixels.
+    fn thumb(&self, lay: &Layout) -> (f32, f32) {
+        let n = self.rows().len().max(1) as f32;
+        let s = self.scale as f32;
+        let thumb_h = (lay.text_h * lay.rows_visible as f32 / n)
+            .max(24.0 * s)
+            .min(lay.text_h);
+        let max = self.max_scroll();
+        let frac = if max > 0.0 {
+            (self.scroll_y / max) as f32
+        } else {
+            0.0
+        };
+        (lay.text_top + (lay.text_h - thumb_h) * frac, thumb_h)
     }
 
     // ---- scrolling / cursor -------------------------------------------------------------
@@ -329,6 +427,37 @@ impl App {
         self.set_first_row(self.cursor as i64 - (lay.rows_visible / 2) as i64);
     }
 
+    /// Puts the cursor on a change and scrolls so the whole change is in view when it fits,
+    /// with a little context above it.
+    fn show_hunk(&mut self, lay: &Layout, idx: usize) {
+        let Some(h) = self.hunks().get(idx) else {
+            return;
+        };
+        let (start, end) = (h.rows.start as usize, h.rows.end as usize);
+        self.cursor = start;
+        let first = self.first_row();
+        let so = self.scrolloff(lay);
+        let fits = end.saturating_sub(start) + 2 * so <= lay.rows_visible;
+        let visible = if fits {
+            start >= first + so && end + so <= first + lay.rows_visible
+        } else {
+            start >= first + so && start + so < first + lay.rows_visible
+        };
+        if !visible {
+            self.set_first_row(start as i64 - (lay.rows_visible / 4) as i64);
+        }
+    }
+
+    /// Index of the change containing the cursor, if any.
+    fn current_hunk(&self) -> Option<usize> {
+        let l = self.loaded()?;
+        let i = l.diff.hunk_at_or_before(self.cursor as u32)?;
+        l.diff.hunks[i]
+            .rows
+            .contains(&(self.cursor as u32))
+            .then_some(i)
+    }
+
     // ---- actions ------------------------------------------------------------------------
 
     fn apply(&mut self, action: Action, el: &ActiveEventLoop) {
@@ -364,18 +493,14 @@ impl App {
             Action::GoRow(r) => self.go_to_row(&lay, (r.max(1) - 1) as usize),
             Action::NextHunk(k) => self.jump_hunk(&lay, k as i64),
             Action::PrevHunk(k) => self.jump_hunk(&lay, -(k as i64)),
-            Action::FirstHunk => {
-                if let Some(h) = self.hunks().first() {
-                    let r = h.rows.start as usize;
-                    self.jump_to_row(&lay, r);
-                }
-            }
+            Action::FirstHunk => self.show_hunk(&lay, 0),
             Action::LastHunk => {
-                if let Some(h) = self.hunks().last() {
-                    let r = h.rows.start as usize;
-                    self.jump_to_row(&lay, r);
-                }
+                let last = self.hunks().len().saturating_sub(1);
+                self.show_hunk(&lay, last);
             }
+            Action::NextFile(k) => self.step_file(k as i64),
+            Action::PrevFile(k) => self.step_file(-(k as i64)),
+            Action::OpenPicker => self.open_picker(),
             Action::ScrollCols(d) => {
                 self.scroll_x = (self.scroll_x.round() + d as f64).max(0.0);
             }
@@ -427,22 +552,16 @@ impl App {
         self.clamp_cursor();
     }
 
-    fn hunks(&self) -> &[diff::Hunk] {
-        match &self.state {
-            State::Ready(l) => &l.diff.hunks,
-            _ => &[],
-        }
-    }
-
     fn jump_hunk(&mut self, lay: &Layout, delta: i64) {
-        let State::Ready(l) = &self.state else { return };
-        let hunks = &l.diff.hunks;
-        if hunks.is_empty() {
-            self.message = Some("no changes".into());
+        let Some(l) = self.loaded() else { return };
+        if l.diff.hunks.is_empty() {
+            self.message = Some("no changes in this file".into());
             return;
         }
         let cur = self.cursor as u32;
         let at = l.diff.hunk_at_or_before(cur);
+        let count = l.diff.hunks.len() as i64;
+        let hunk_start = |i: usize| l.diff.hunks[i].rows.start as usize;
         // Position relative to hunk starts: `at` is the hunk we are in or just after.
         let target = if delta > 0 {
             let base = match at {
@@ -453,32 +572,29 @@ impl App {
         } else {
             let base = match at {
                 None => 0,
-                Some(i) if hunks[i].rows.start < cur => i as i64 + 1,
+                Some(i) if (hunk_start(i) as u32) < cur => i as i64 + 1,
                 Some(i) => i as i64,
             };
             base + delta
         };
-        if target < 0 || target >= hunks.len() as i64 {
+        if target < 0 || target >= count {
+            let clamped = target.clamp(0, count - 1) as usize;
+            let at_edge = hunk_start(clamped) == self.cursor;
             self.message = Some(if delta > 0 {
                 "no next change".into()
             } else {
                 "no previous change".into()
             });
-            let clamped = target.clamp(0, hunks.len() as i64 - 1) as usize;
-            let row = hunks[clamped].rows.start as usize;
-            if row != self.cursor {
-                self.jump_to_row(lay, row);
+            if !at_edge {
+                self.show_hunk(lay, clamped);
             }
             return;
         }
-        let row = hunks[target as usize].rows.start as usize;
-        self.jump_to_row(lay, row);
+        self.show_hunk(lay, target as usize);
     }
 
     fn widest_visible_line(&self, lay: &Layout) -> i64 {
-        let State::Ready(l) = &self.state else {
-            return 0;
-        };
+        let Some(l) = self.loaded() else { return 0 };
         let first = self.first_row();
         let mut widest = 0;
         for row in l.diff.rows.iter().skip(first).take(lay.rows_visible + 1) {
@@ -504,13 +620,25 @@ impl App {
         }
         self.ws_mode = mode;
         self.message = Some(format!("whitespace: {}", mode.label()));
-        let State::Ready(l) = &self.state else { return };
+        self.request_rediff(self.current);
+    }
+
+    /// Re-diffs `file` in the background if its diff was computed with another mode.
+    fn request_rediff(&mut self, file: usize) {
+        let Some(slot) = self.files.get(file) else {
+            return;
+        };
+        let State::Ready(l) = &slot.state else { return };
+        if l.diff.mode == self.ws_mode {
+            return;
+        }
         let (a, b) = (l.left.clone(), l.right.clone());
+        let mode = self.ws_mode;
         let tx = self.tx.clone();
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let d = diff::diff_files(&a, &b, mode);
-            let _ = tx.send(Msg::Rediff(d));
+            let diff = diff::diff_files(&a, &b, mode);
+            let _ = tx.send(Msg::Rediff { file, diff });
             let _ = proxy.send_event(());
         });
     }
@@ -535,7 +663,7 @@ impl App {
             self.message = Some("no previous search".into());
             return;
         };
-        let State::Ready(l) = &self.state else { return };
+        let Some(l) = self.loaded() else { return };
         let _s = trace::span("search");
         let n = l.diff.rows.len();
         if n == 0 {
@@ -584,39 +712,330 @@ impl App {
         }
     }
 
+    // ---- files ---------------------------------------------------------------------------
+
+    fn step_file(&mut self, delta: i64) {
+        let n = self.files.len() as i64;
+        if n <= 1 {
+            self.message = Some("only one file".into());
+            return;
+        }
+        let target = self.current as i64 + delta;
+        if target < 0 || target >= n {
+            self.message = Some(if delta > 0 {
+                "no next file".into()
+            } else {
+                "no previous file".into()
+            });
+            return;
+        }
+        self.switch_to(target as usize);
+    }
+
+    fn switch_to(&mut self, idx: usize) {
+        if idx >= self.files.len() {
+            return;
+        }
+        if idx != self.current {
+            let view = View {
+                scroll_y: self.scroll_y,
+                scroll_x: self.scroll_x,
+                cursor: self.cursor,
+                landed: self.files[self.current].view.landed,
+            };
+            self.files[self.current].view = view;
+            self.current = idx;
+            let v = self.files[idx].view;
+            self.scroll_y = v.scroll_y;
+            self.scroll_x = v.scroll_x;
+            self.cursor = v.cursor;
+            self.intra_cache.clear();
+            self.wanted.store(idx, Ordering::Relaxed);
+        }
+        self.mru.retain(|&i| i != idx);
+        self.mru.insert(0, idx);
+        self.request_rediff(idx);
+        self.land_if_needed();
+        self.update_title();
+    }
+
+    /// Performs the initial positioning for the current file once its diff is available.
+    fn land_if_needed(&mut self) {
+        let Some(slot) = self.files.get(self.current) else {
+            return;
+        };
+        if slot.view.landed || !matches!(slot.state, State::Ready(_)) {
+            return;
+        }
+        let lay = self.layout();
+        self.cursor = 0;
+        self.scroll_y = 0.0;
+        let start_row = if self.current == 0 {
+            self.opts.start_row
+        } else {
+            None
+        };
+        if let Some(r) = start_row {
+            self.jump_to_row(&lay, (r.max(1) - 1) as usize);
+        } else if !self.hunks().is_empty() {
+            self.show_hunk(&lay, 0);
+        }
+        self.files[self.current].view.landed = true;
+    }
+
+    fn update_title(&self) {
+        let Some(w) = &self.window else { return };
+        let title = match self.files.get(self.current) {
+            Some(f) if self.files.len() > 1 => format!(
+                "diffvader — {}  ({}/{})",
+                f.entry.rel,
+                self.current + 1,
+                self.files.len()
+            ),
+            Some(f) => format!("diffvader — {}", f.entry.rel),
+            None => "diffvader".to_string(),
+        };
+        w.set_title(&title);
+    }
+
+    // ---- picker --------------------------------------------------------------------------
+
+    fn open_picker(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        if let Some(p) = &mut self.picker {
+            // Repeated Cmd-P cycles through the list, like VS Code.
+            if !p.results.is_empty() {
+                p.selected = (p.selected + 1) % p.results.len();
+            }
+            return;
+        }
+        let mut p = Picker {
+            query: String::new(),
+            selected: 0,
+            scroll: 0,
+            results: Vec::new(),
+        };
+        self.fill_picker(&mut p);
+        // Enter on a fresh picker goes to the previously viewed file.
+        if p.results.len() > 1 {
+            p.selected = 1;
+        }
+        self.picker = Some(p);
+    }
+
+    fn fill_picker(&self, p: &mut Picker) {
+        let _s = trace::span("picker-filter");
+        p.results.clear();
+        if p.query.trim().is_empty() {
+            for &i in &self.mru {
+                p.results.push(PickResult {
+                    file: i,
+                    positions: Vec::new(),
+                });
+            }
+            for i in 0..self.files.len() {
+                if !self.mru.contains(&i) {
+                    p.results.push(PickResult {
+                        file: i,
+                        positions: Vec::new(),
+                    });
+                }
+            }
+        } else {
+            let mut scored: Vec<(i32, usize, Vec<u32>)> = self
+                .files
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| {
+                    fuzzy::fuzzy_match(&p.query, &f.entry.rel).map(|m| (m.score, i, m.positions))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            p.results.extend(
+                scored
+                    .into_iter()
+                    .map(|(_, file, positions)| PickResult { file, positions }),
+            );
+        }
+        p.selected = 0;
+        p.scroll = 0;
+    }
+
+    fn picker_key(&mut self, key: &Key, ctrl: bool, cmd: bool) {
+        let Some(mut p) = self.picker.take() else {
+            return;
+        };
+        let n = p.results.len();
+        let mut keep = true;
+        match key {
+            Key::Named(NamedKey::Escape) => keep = false,
+            Key::Named(NamedKey::Enter) => {
+                if let Some(r) = p.results.get(p.selected) {
+                    let file = r.file;
+                    self.switch_to(file);
+                }
+                keep = false;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if n > 0 {
+                    p.selected = (p.selected + 1) % n;
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if n > 0 {
+                    p.selected = (p.selected + n - 1) % n;
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if p.query.pop().is_some() {
+                    self.fill_picker(&mut p);
+                }
+            }
+            Key::Named(NamedKey::Space) => {
+                p.query.push(' ');
+                self.fill_picker(&mut p);
+            }
+            Key::Character(s) if ctrl => match s.as_str() {
+                "n" | "j" => {
+                    if n > 0 {
+                        p.selected = (p.selected + 1) % n;
+                    }
+                }
+                "p" | "k" => {
+                    if n > 0 {
+                        p.selected = (p.selected + n - 1) % n;
+                    }
+                }
+                "u" => {
+                    p.query.clear();
+                    self.fill_picker(&mut p);
+                }
+                "c" | "g" => keep = false,
+                _ => {}
+            },
+            Key::Character(s) if cmd => {
+                if s.as_str() == "p" && n > 0 {
+                    p.selected = (p.selected + 1) % n;
+                }
+            }
+            Key::Character(s) => {
+                p.query.push_str(s);
+                self.fill_picker(&mut p);
+            }
+            _ => {}
+        }
+        if p.selected < p.scroll {
+            p.scroll = p.selected;
+        } else if p.selected >= p.scroll + PICKER_ROWS {
+            p.scroll = p.selected + 1 - PICKER_ROWS;
+        }
+        if keep {
+            self.picker = Some(p);
+        }
+    }
+
+    // ---- mouse ---------------------------------------------------------------------------
+
+    fn mouse_down(&mut self) {
+        let lay = self.layout();
+        let (mx, my) = self.mouse;
+        if my < lay.text_top || my >= lay.text_top + lay.text_h {
+            return;
+        }
+        if mx >= lay.scrollbar_x {
+            let (ty, th) = self.thumb(&lay);
+            if my >= ty && my < ty + th {
+                self.drag = Some(my - ty);
+            } else {
+                // Jump so the thumb is centered under the pointer, then keep dragging.
+                self.drag = Some(th / 2.0);
+                self.drag_to(&lay, my);
+            }
+            return;
+        }
+        // Click in the text area places the cursor on that row.
+        let row = self.first_row() + ((my - lay.text_top) / self.line_h) as usize;
+        if row < self.rows().len() {
+            self.cursor = row;
+        }
+    }
+
+    fn drag_to(&mut self, lay: &Layout, my: f32) {
+        let Some(grab) = self.drag else { return };
+        let (_, th) = self.thumb(lay);
+        let track = (lay.text_h - th).max(1.0);
+        let frac = ((my - grab - lay.text_top) / track).clamp(0.0, 1.0) as f64;
+        self.scroll_y = frac * self.max_scroll();
+        self.clamp_scroll();
+        self.clamp_cursor_to_view(lay);
+    }
+
     // ---- messages from background threads ------------------------------------------------
 
     fn drain_messages(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Loaded(Ok(l)) => {
-                    trace::mark("diff-received");
-                    self.ws_mode = l.diff.mode;
-                    self.state = State::Ready(l);
-                    self.intra_cache.clear();
-                    self.cursor = 0;
-                    // Land on the first change, like vimdiff does (or on the requested row).
-                    let lay = self.layout();
-                    if let Some(r) = self.opts.start_row {
-                        self.jump_to_row(&lay, (r.max(1) - 1) as usize);
-                    } else if let Some(h) = self.hunks().first() {
-                        let r = h.rows.start as usize;
-                        self.jump_to_row(&lay, r);
-                    }
+                Msg::Files(Ok(set)) => {
+                    trace::mark("files-received");
+                    self.dir_mode = set.dir_mode;
+                    self.files = set
+                        .entries
+                        .into_iter()
+                        .map(|entry| FileSlot {
+                            entry,
+                            state: State::Loading,
+                            view: View::default(),
+                            stats: None,
+                        })
+                        .collect();
+                    self.current = 0;
+                    self.mru = vec![0];
+                    self.update_title();
                 }
-                Msg::Loaded(Err(e)) => self.state = State::Failed(e),
-                Msg::Rediff(d) => {
-                    if d.mode != self.ws_mode {
-                        continue;
-                    }
-                    let cursor = self.cursor;
-                    let first_row = self.first_row();
-                    let State::Ready(l) = &mut self.state else {
+                Msg::Files(Err(e)) => self.global = State::Failed(e),
+                Msg::Loaded { file, result } => {
+                    let Some(slot) = self.files.get_mut(file) else {
                         continue;
                     };
+                    match result {
+                        Ok(l) => {
+                            if file == self.current {
+                                trace::mark("diff-received");
+                            }
+                            slot.stats = Some((l.diff.added, l.diff.removed));
+                            slot.state = State::Ready(l);
+                            if file == self.current {
+                                self.intra_cache.clear();
+                                self.request_rediff(file);
+                                self.land_if_needed();
+                            }
+                        }
+                        Err(e) => slot.state = State::Failed(e),
+                    }
+                }
+                Msg::Rediff { file, diff } => {
+                    if diff.mode != self.ws_mode {
+                        continue;
+                    }
+                    let is_current = file == self.current;
+                    let cursor = self.cursor;
+                    let first_row = self.first_row();
+                    let Some(slot) = self.files.get_mut(file) else {
+                        continue;
+                    };
+                    let State::Ready(l) = &mut slot.state else {
+                        continue;
+                    };
+                    slot.stats = Some((diff.added, diff.removed));
+                    if !is_current {
+                        l.diff = diff;
+                        continue;
+                    }
                     let old = l.diff.rows.get(cursor).copied();
                     let old_first = l.diff.rows.get(first_row).copied();
-                    l.diff = d;
+                    l.diff = diff;
                     self.intra_cache.clear();
                     let rows = &l.diff.rows;
                     let remap = |r: Option<Row>| -> Option<usize> {
@@ -652,6 +1071,17 @@ impl App {
         }
         let frame_start = Instant::now();
         let _s = trace::span("frame");
+        let has_diff = matches!(self.state(), State::Ready(_) | State::Failed(_));
+        // Debug aid: `DIFFVADER_PICKER=query` opens the picker before a `--screenshot`.
+        if has_diff && !self.first_diff_frame_done && self.opts.screenshot.is_some() {
+            if let Ok(q) = std::env::var("DIFFVADER_PICKER") {
+                self.open_picker();
+                for ch in q.chars() {
+                    let key = Key::Character(ch.to_string().into());
+                    self.picker_key(&key, false, false);
+                }
+            }
+        }
         let lay = self.layout();
         for attempt in 0..2 {
             let _b = trace::span("frame-build");
@@ -669,7 +1099,6 @@ impl App {
         let gpu = self.gpu.as_mut().unwrap();
         gpu.sync_atlas(&mut self.atlas);
         let clear = theme::to_f64(self.theme.bg);
-        let has_diff = matches!(self.state, State::Ready(_) | State::Failed(_));
         if self.bench_remaining > 0 || (self.bench_start.is_some() && has_diff) {
             gpu.render_offscreen(&self.draw, clear);
             trace::frame_done(frame_start.elapsed());
@@ -776,9 +1205,7 @@ impl App {
         if let Some(d) = self.intra_cache.get(&row_idx) {
             return d.clone();
         }
-        let State::Ready(l) = &self.state else {
-            return None;
-        };
+        let l = self.loaded()?;
         let row = l.diff.rows[row_idx as usize];
         let _s = trace::span("intra-diff");
         let d = diff::intra_diff(
@@ -919,6 +1346,37 @@ impl Painter<'_> {
         cx - x
     }
 
+    /// Like `text`, with the chars at `highlight` (char indices) drawn in `hl_color`.
+    fn text_hl(
+        &mut self,
+        x: f32,
+        y: f32,
+        s: &str,
+        color: u32,
+        highlight: &[u32],
+        hl_color: u32,
+    ) -> f32 {
+        let mut cx = x;
+        let mut hi = 0;
+        for (i, c) in s.chars().enumerate() {
+            while hi < highlight.len() && (highlight[hi] as usize) < i {
+                hi += 1;
+            }
+            let col = if hi < highlight.len() && highlight[hi] as usize == i {
+                hl_color
+            } else {
+                color
+            };
+            let cells = if c == ' ' {
+                1
+            } else {
+                self.glyph(cx, y, c, col)
+            };
+            cx += cells as f32 * self.cell_w;
+        }
+        cx - x
+    }
+
     fn text_width(&self, s: &str) -> f32 {
         s.chars()
             .map(|c| {
@@ -1038,10 +1496,12 @@ fn build_frame(app: &mut App, lay: &Layout) {
     let scroll_x_cells = app.scroll_x.round() as i64;
     let scroll_x_px = app.scroll_x as f32 * cell_w;
     let full = [0, 0, lay.w as u32, lay.h as u32];
+    let (thumb_y, thumb_h) = app.thumb(lay);
+    let cur_hunk: Option<Range<u32>> = app.current_hunk().map(|i| app.hunks()[i].rows.clone());
 
     // Pre-compute intra-line diffs for visible modify rows (needs &mut app).
     let mut intra: Vec<(usize, Option<IntraDiff>)> = Vec::new();
-    if let State::Ready(_) = &app.state {
+    {
         let rows_len = app.rows().len();
         let end = (first_row + lay.rows_visible + 1).min(rows_len);
         for idx in first_row..end {
@@ -1072,11 +1532,15 @@ fn build_frame(app: &mut App, lay: &Layout) {
         draw,
         atlas,
         fonts,
-        state,
+        files,
+        current,
+        dir_mode,
+        global,
         cursor,
         help,
         message,
         vi,
+        picker,
         ws_mode,
         opts,
         ..
@@ -1090,6 +1554,12 @@ fn build_frame(app: &mut App, lay: &Layout) {
         white,
     };
     let cursor = *cursor;
+    let current = *current;
+    let slot = files.get(current);
+    let state: &State = match slot {
+        Some(f) => &f.state,
+        None => global,
+    };
 
     // ---- chrome backgrounds ----
     p.draw.begin(full);
@@ -1112,6 +1582,13 @@ fn build_frame(app: &mut App, lay: &Layout) {
         lay.text_h,
         th.divider,
     );
+    p.rect(
+        lay.scrollbar_x,
+        lay.text_top,
+        lay.scrollbar_w,
+        lay.text_h,
+        th.scrollbar_track,
+    );
 
     match state {
         State::Loading => {
@@ -1131,7 +1608,6 @@ fn build_frame(app: &mut App, lay: &Layout) {
         State::Ready(l) => {
             let rows = &l.diff.rows;
             let end = (first_row + lay.rows_visible + 1).min(rows.len());
-            let ws_mode = *ws_mode;
 
             // Row backgrounds, hunk bars and line numbers (full-window batch).
             let digits = ((lay.gutter_w - 4.0 * s) / cell_w) as usize;
@@ -1139,6 +1615,7 @@ fn build_frame(app: &mut App, lay: &Layout) {
             for idx in first_row..end {
                 let row = rows[idx];
                 let y = lay.text_top + (idx - first_row) as f32 * line_h - frac;
+                let in_cur = cur_hunk.as_ref().is_some_and(|h| h.contains(&(idx as u32)));
                 let (lbg, rbg, bar) = match row.kind {
                     RowKind::Equal => (0, 0, if row.ws_only { th.ws_hidden_marker } else { 0 }),
                     RowKind::Delete => (th.del_bg, th.filler_bg, th.scrollbar_del),
@@ -1152,7 +1629,15 @@ fn build_frame(app: &mut App, lay: &Layout) {
                     if bg != 0 {
                         p.rect(x, y, w, line_h, bg);
                     }
-                    if bar != 0 {
+                    if in_cur {
+                        p.rect(
+                            lay.pane_x[side],
+                            y,
+                            (4.0 * s).round(),
+                            line_h,
+                            th.status_accent,
+                        );
+                    } else if bar != 0 {
                         p.rect(lay.pane_x[side], y, (3.0 * s).round(), line_h, bar);
                     }
                     let line = if side == 0 { row.left } else { row.right };
@@ -1163,7 +1648,7 @@ fn build_frame(app: &mut App, lay: &Layout) {
                         let nx = lay.pane_x[side]
                             + 4.0 * s
                             + (digits.saturating_sub(num_buf.len() + 1)) as f32 * cell_w;
-                        let color = if idx == cursor {
+                        let color = if in_cur || idx == cursor {
                             th.gutter_fg_cursor
                         } else {
                             th.gutter_fg
@@ -1171,13 +1656,12 @@ fn build_frame(app: &mut App, lay: &Layout) {
                         p.text(nx, y, &num_buf, color);
                     }
                 }
-                if idx == cursor {
-                    p.rect(0.0, y, lay.w - lay.scrollbar_w, line_h, th.cursor_row);
+                if in_cur || (cur_hunk.is_none() && idx == cursor) {
+                    p.rect(0.0, y, lay.scrollbar_x, line_h, th.cursor_row);
                 }
             }
 
-            // Scrollbar with change ticks.
-            let sb_x = lay.w - lay.scrollbar_w;
+            // Scrollbar: change ticks in the track, thumb on top.
             let n = rows.len().max(1) as f32;
             if l.diff.hunks.len() <= 20_000 {
                 for h in &l.diff.hunks {
@@ -1190,34 +1674,25 @@ fn build_frame(app: &mut App, lay: &Layout) {
                         _ => th.hunk_marker,
                     };
                     p.rect(
-                        sb_x + 2.0 * s,
+                        lay.scrollbar_x + 3.0 * s,
                         y0,
-                        lay.scrollbar_w - 4.0 * s,
-                        (y1 - y0).max(1.0 * s),
+                        lay.scrollbar_w - 6.0 * s,
+                        (y1 - y0).max(2.0 * s),
                         color,
                     );
                 }
             }
-            let thumb_y0 = lay.text_top + lay.text_h * (first_row as f32 / n);
-            let thumb_h = (lay.text_h * lay.rows_visible as f32 / n)
-                .max(4.0 * s)
-                .min(lay.text_h);
             p.rect(
-                sb_x,
-                thumb_y0.min(lay.text_top + lay.text_h - thumb_h),
-                lay.scrollbar_w,
+                lay.scrollbar_x + 2.0 * s,
+                thumb_y,
+                lay.scrollbar_w - 4.0 * s,
                 thumb_h,
                 th.scrollbar,
             );
 
             // Text, one scissored batch per pane.
             for side in 0..2 {
-                let (file, other) = if side == 0 {
-                    (&l.left, &l.right)
-                } else {
-                    (&l.right, &l.left)
-                };
-                let _ = other;
+                let file = if side == 0 { &l.left } else { &l.right };
                 let clip_x = (lay.pane_x[side] + lay.gutter_w) as u32;
                 let clip_w = (lay.pane_w - lay.gutter_w).max(0.0) as u32;
                 p.draw
@@ -1315,23 +1790,49 @@ fn build_frame(app: &mut App, lay: &Layout) {
                     draw_line(&mut p, x0, y, bytes, &st);
                 }
             }
-            let _ = ws_mode;
         }
     }
 
-    // ---- header and status text ----
+    // ---- header ----
     p.draw.begin(full);
     let header_y = (lay.header_h - line_h) / 2.0;
-    for side in 0..2 {
-        let title = if side == 0 {
-            &opts.left_title
-        } else {
-            &opts.right_title
-        };
-        let max_cells = ((lay.pane_w - 8.0 * s) / cell_w) as usize;
-        let shown = truncate_left(title, max_cells);
-        p.text(lay.pane_x[side] + 4.0 * s, header_y, &shown, th.status_fg);
+    let status_color = |st: Status| match st {
+        Status::Added => th.status_added,
+        Status::Deleted => th.status_deleted,
+        Status::Modified => th.status_accent,
+    };
+    match slot {
+        Some(f) if *dir_mode || files.len() > 1 => {
+            let mut x = 4.0 * s;
+            let letter = f.entry.status.letter().to_string();
+            x += p.text(x, header_y, &letter, status_color(f.entry.status)) + cell_w;
+            let max_cells = ((lay.w * 0.6) / cell_w) as usize;
+            let shown = truncate_left(&f.entry.rel, max_cells);
+            x += p.text(x, header_y, &shown, th.fg) + 2.0 * cell_w;
+            let mut info = format!("{} of {}", current + 1, files.len());
+            if let Some((a, r)) = f.stats {
+                info.push_str(&format!("   +{a} −{r}"));
+            }
+            p.text(x, header_y, &info, th.status_dim);
+            let hint = "⌘P files   ]f [f next/prev";
+            let hw = p.text_width(hint);
+            p.text(lay.w - hw - 6.0 * s, header_y, hint, th.status_dim);
+        }
+        Some(_) | None => {
+            for side in 0..2 {
+                let title = if side == 0 {
+                    &opts.left_title
+                } else {
+                    &opts.right_title
+                };
+                let max_cells = ((lay.pane_w - 8.0 * s) / cell_w) as usize;
+                let shown = truncate_left(title, max_cells);
+                p.text(lay.pane_x[side] + 4.0 * s, header_y, &shown, th.status_fg);
+            }
+        }
     }
+
+    // ---- status bar ----
     let status_y = lay.h - lay.status_h + (lay.status_h - line_h) / 2.0;
     let pending = vi.pending_display();
     let mut left_text = String::new();
@@ -1387,6 +1888,121 @@ fn build_frame(app: &mut App, lay: &Layout) {
     let center_x = ((lay.w - ww) / 2.0).max(4.0 * s + p.text_width(&left_text) + 3.0 * cell_w);
     if center_x + ww < lay.w - rw - 8.0 * s {
         p.text(center_x, status_y, &ws_text, th.status_dim);
+    }
+
+    // ---- quick-open picker ----
+    if let Some(pk) = picker {
+        let box_w = (lay.w * 0.6).min(110.0 * cell_w).max(30.0 * cell_w);
+        let bx = ((lay.w - box_w) / 2.0).round();
+        let by = lay.header_h + 6.0 * s;
+        let row_h = line_h + 4.0 * s;
+        let shown = pk.results.len().min(PICKER_ROWS);
+        let box_h = row_h * (shown as f32 + 1.0) + 8.0 * s;
+        p.rect(
+            bx - s,
+            by - s,
+            box_w + 2.0 * s,
+            box_h + 2.0 * s,
+            th.picker_border,
+        );
+        p.rect(bx, by, box_w, box_h, th.picker_bg);
+        // Input line.
+        let pad = cell_w;
+        let iy = by + 4.0 * s;
+        p.rect(bx + pad / 2.0, iy, box_w - pad, row_h, th.gutter_bg);
+        let ty = iy + 2.0 * s;
+        let prompt_w = p.text(bx + pad, ty, "› ", th.status_dim);
+        let qw = if pk.query.is_empty() {
+            p.text(
+                bx + pad + prompt_w,
+                ty,
+                "type to filter files",
+                th.status_dim,
+            );
+            0.0
+        } else {
+            p.text(bx + pad + prompt_w, ty, &pk.query, th.fg)
+        };
+        p.rect(
+            bx + pad + prompt_w + qw,
+            ty,
+            (2.0 * s).round(),
+            line_h,
+            th.status_accent,
+        );
+        // Results.
+        let list_y = iy + row_h + 4.0 * s;
+        if pk.results.is_empty() {
+            p.text(
+                bx + pad,
+                list_y + 2.0 * s,
+                "no matching files",
+                th.status_dim,
+            );
+        }
+        let max_path_cells = ((box_w - 3.0 * pad) / cell_w) as usize;
+        for (vi_row, r) in pk
+            .results
+            .iter()
+            .enumerate()
+            .skip(pk.scroll)
+            .take(PICKER_ROWS)
+        {
+            let ry = list_y + (vi_row - pk.scroll) as f32 * row_h;
+            if vi_row == pk.selected {
+                p.rect(bx + pad / 2.0, ry, box_w - pad, row_h, th.picker_selected);
+            }
+            let f = &files[r.file];
+            let ty = ry + 2.0 * s;
+            let mut x = bx + pad;
+            let letter = f.entry.status.letter().to_string();
+            x += p.text(x, ty, &letter, status_color(f.entry.status)) + cell_w;
+            let stats = match f.stats {
+                Some((a, d)) => format!("+{a} −{d}"),
+                None => String::new(),
+            };
+            let sw = p.text_width(&stats);
+            let avail = max_path_cells.saturating_sub((sw / cell_w) as usize + 4);
+            let (path, positions): (String, Vec<u32>) = if f.entry.rel.chars().count() > avail {
+                // Truncate from the left; matched positions shift accordingly.
+                let shown = truncate_left(&f.entry.rel, avail);
+                let dropped = f.entry.rel.chars().count() + 1 - shown.chars().count();
+                let pos = r
+                    .positions
+                    .iter()
+                    .filter_map(|&q| (q as usize).checked_sub(dropped).map(|v| (v + 1) as u32))
+                    .collect();
+                (shown, pos)
+            } else {
+                (f.entry.rel.clone(), r.positions.clone())
+            };
+            let name_start = path.rfind('/').map_or(0, |i| i + 1);
+            let name_char_start = path[..name_start].chars().count();
+            let dir_part = &path[..name_start];
+            let name_part = &path[name_start..];
+            let name_pos: Vec<u32> = positions
+                .iter()
+                .filter_map(|&q| (q as usize).checked_sub(name_char_start).map(|v| v as u32))
+                .collect();
+            let name_color = if r.file == current {
+                th.status_accent
+            } else {
+                th.fg
+            };
+            x += p.text_hl(x, ty, name_part, name_color, &name_pos, th.picker_match) + 2.0 * cell_w;
+            if !dir_part.is_empty() {
+                let dir_pos: Vec<u32> = positions
+                    .iter()
+                    .filter(|&&q| (q as usize) < name_char_start)
+                    .copied()
+                    .collect();
+                let dir_shown = dir_part.trim_end_matches('/');
+                p.text_hl(x, ty, dir_shown, th.status_dim, &dir_pos, th.picker_match);
+            }
+            if !stats.is_empty() {
+                p.text(bx + box_w - pad - sw, ty, &stats, th.status_dim);
+            }
+        }
     }
 
     // ---- help overlay ----
@@ -1458,12 +2074,13 @@ fn truncate_left(s: &str, max_cells: usize) -> String {
 
 const HELP_LINES: &[&str] = &[
     "diffvader keys",
-    "  j / k / ↓ / ↑        move cursor       ^e / ^y   scroll one line",
-    "  ^d / ^u              half page         ^f / ^b   full page",
+    "  j / k  ]c / [c       next / previous change     [C / ]C   first / last change",
+    "  ↓ / ↑  ^e / ^y       move one line / scroll one line",
+    "  ^d / ^u  ^f / ^b     half page / full page",
     "  gg / G / :N          top / bottom / row N",
-    "  ]c / [c              next / previous change     [C / ]C   first / last",
     "  zt / zz / zb         cursor to top / center / bottom",
     "  h / l / 0 / $        scroll horizontally",
+    "  ⌘P  or  :e           open a file (fuzzy)        ]f / [f   next / previous file",
     "  /pat  n  N           search (smart case)",
     "  w  or  :ws <mode>    cycle whitespace: exact, eol, change, all",
     "  + / -  (⌘= / ⌘-)     zoom      t  toggle light/dark",
@@ -1491,10 +2108,7 @@ impl ApplicationHandler<()> for App {
         drop(_m);
         let _s = trace::span("window-create");
         let attrs = Window::default_attributes()
-            .with_title(format!(
-                "diffvader — {} ↔ {}",
-                self.opts.left_title, self.opts.right_title
-            ))
+            .with_title("diffvader")
             .with_inner_size(size);
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -1526,6 +2140,7 @@ impl ApplicationHandler<()> for App {
         trace::mark("window-ready");
         self.window = Some(window.clone());
         self.drain_messages();
+        self.update_title();
         // Draw now rather than waiting for AppKit's first redraw request; the request is
         // still made so a frame lands after the window is fully on screen.
         self.render();
@@ -1584,16 +2199,50 @@ impl ApplicationHandler<()> for App {
                     return;
                 }
                 trace::mark("key");
-                let input = KeyInput {
-                    key: &event.logical_key,
-                    ctrl: self.modifiers.control_key(),
-                    cmd: self.modifiers.super_key(),
-                };
-                if !self.vi.in_command_line() {
-                    self.message = None;
+                let ctrl = self.modifiers.control_key();
+                let cmd = self.modifiers.super_key();
+                if self.picker.is_some() {
+                    self.picker_key(&event.logical_key, ctrl, cmd);
+                } else {
+                    let input = KeyInput {
+                        key: &event.logical_key,
+                        ctrl,
+                        cmd,
+                    };
+                    if !self.vi.in_command_line() {
+                        self.message = None;
+                    }
+                    if let Some(action) = self.vi.key(input) {
+                        self.apply(action, el);
+                    }
                 }
-                if let Some(action) = self.vi.key(input) {
-                    self.apply(action, el);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse = (position.x as f32, position.y as f32);
+                if self.drag.is_some() {
+                    let lay = self.layout();
+                    self.drag_to(&lay, position.y as f32);
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button != MouseButton::Left {
+                    return;
+                }
+                match state {
+                    ElementState::Pressed => {
+                        if self.picker.is_some() {
+                            self.picker = None;
+                        } else {
+                            self.mouse_down();
+                        }
+                    }
+                    ElementState::Released => self.drag = None,
                 }
                 if let Some(w) = &self.window {
                     w.request_redraw();

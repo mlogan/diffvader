@@ -5,15 +5,19 @@ Built to be used as a `git difftool`.
 
 ```
 cargo build --release
-./target/release/diffvader old.rs new.rs
 ./target/release/diffvader --install-git      # sets diff.tool=diffvader in ~/.gitconfig
-git difftool HEAD~1
+
+diffvader --git HEAD~3                        # all files changed since HEAD~3, one at a time
+git difftool -d HEAD~3                        # same thing through git
+diffvader old.rs new.rs                       # two files
+diffvader tree-a/ tree-b/                     # two directory trees
 ```
 
 ## Usage
 
 ```
-diffvader [options] LEFT RIGHT [+ROW]
+diffvader [options] LEFT RIGHT [+ROW]         compare two files, or two directory trees
+diffvader [options] [--git GIT-DIFF-ARGS]     run `git difftool -d` with diffvader
 
   -w, --ignore-all-space       ignore all whitespace
   -b, --ignore-space-change    ignore changes in the amount of whitespace
@@ -31,22 +35,31 @@ diffvader [options] LEFT RIGHT [+ROW]
       --install-git            write that config with `git config --global`
 ```
 
+When given two directories (which is what `git difftool --dir-diff` passes), every
+differing file is loaded in the background and shown one at a time. The header shows the
+current file, its position in the set and its line counts. `⌘P` opens a VS Code style
+quick-open: type to fuzzy-filter, `↑`/`↓` or `^p`/`^n` to move, `Enter` to open, `Esc` to
+close; with an empty query the list is in most-recently-viewed order, so `⌘P Enter` flips
+back to the previous file. `]f` / `[f` step through files in order.
+
 `DIFFVADER_TIMING=1` and `DIFFVADER_TRACE=file.json` are equivalent to the flags, which is
-handy when git launches the tool.
+handy when git launches the tool. Options given before `--git` are forwarded to the child.
 
 ## Keys
 
 | Keys | Action |
 | --- | --- |
-| `j` `k` `↓` `↑` | move cursor (counts work: `10j`) |
+| `j` `k` `]c` `[c` | next / previous change (counts work: `3j`) |
+| `]C` `[C` | last / first change |
+| `↓` `↑` | move cursor one line |
 | `^e` `^y` | scroll one line |
 | `^d` `^u` | half page |
 | `^f` `^b` `Space` `PageDown/Up` | full page |
 | `gg` `G` `:N` `NG` | top / bottom / row N |
-| `]c` `[c` | next / previous change (`3]c` works) |
-| `]C` `[C` | last / first change |
 | `zt` `zz` `zb` | cursor row to top / center / bottom |
 | `h` `l` `0` `$` `←` `→` | horizontal scroll |
+| `⌘P` `:e` | quick-open file picker |
+| `]f` `[f` `:n` `:N` | next / previous file |
 | `/pattern` `n` `N` | search both sides (smart case) |
 | `w` or `:ws exact\|eol\|change\|all` | cycle / set whitespace mode (re-diffs in the background) |
 | `+` `-` `⌘=` `⌘-` `⌘0` | zoom |
@@ -54,7 +67,8 @@ handy when git launches the tool.
 | `?` | help overlay |
 | `q` `ZZ` `:q` `⌘Q` | quit |
 
-Mouse and trackpad scrolling work too; the cursor stays inside the visible rows like vim.
+Mouse: wheel and trackpad scroll, click a row to put the cursor there, click or drag the
+scrollbar on the right (its ticks mark every change).
 
 ## What the colors mean
 
@@ -66,7 +80,8 @@ Mouse and trackpad scrolling work too; the cursor stays inside the visible rows 
   always shown on changed lines.
 - In an ignore-whitespace mode, lines that differ only in whitespace are treated as equal
   but keep a faint gutter marker so the hidden difference is still discoverable.
-- The right edge is a minimap-style scrollbar: ticks mark every change.
+- The current change is marked with a bright bar in both gutters.
+- The scrollbar on the right shows every change as a red / green / blue tick.
 
 ## Performance notes
 
