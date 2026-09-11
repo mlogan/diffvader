@@ -102,8 +102,9 @@ Measured on an M-series Mac Studio, release build, `--timing`:
   files take 1-3 ms. This work fully overlaps AppKit startup. `git dv` with 341 changed
   files reaches its first frame in the same ~150 ms as a two-file diff.
 - `git difftool` is inherently slower because git does work before the tool starts:
-  ~65 ms per file of shell-helper and temp-file setup, or 250-400 ms of temp-tree writing
-  for 341 files in `-d` mode. diffvader still opens a single window: each per-file
+  ~150 ms per file of shell-helper work (six or seven `git config` subprocesses per file,
+  one more when `-t` is not given) of which diffvader's own invocation is ~10 ms, or 250-400
+  ms of temp-tree writing for 341 files in `-d` mode. diffvader still opens a single window: each per-file
   invocation hands its pair to a session and returns, and one detached viewer shows files
   as git produces them. Prefer `git dv`, which reads from git directly.
 - Frame cost (build draw list + upload + render, GPU complete) is ~0.7-0.9 ms median and

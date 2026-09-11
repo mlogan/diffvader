@@ -95,6 +95,21 @@ reports visible and wgpu skips presenting. `--screenshot` and `--bench-scroll` r
 offscreen so they work regardless; `--quit-after-first-frame` fires on the first *built*
 diff frame. `DIFFVADER_EXIT_AFTER_MS=N` exits cleanly (writing traces) after N ms.
 
+## Perf audit (2026-09-11)
+
+- `git dv` viewer: first diff frame 150-170 ms; every span outside AppKit's own setup is
+  under 5 ms. git discovery (25-30 ms) and the first blob read run on the loader thread and
+  finish long before the window exists. Nothing left but the borderless-window option.
+- The window is on screen ~90 ms before our first frame is presented (AppKit orders it
+  front, then the occlusion state flips and we draw). The NSWindow background is now set
+  to the theme color so that interval is not a gray flash.
+- `git difftool` per file: our `--difftool` invocation is ~10-15 ms including dyld and
+  exit. git's shell helper costs ~150 ms/file here: 6-7 `git config` subprocesses (~15-25
+  ms each incl. shell) plus an extra `git config diff.tool` per file when no `-t` is given.
+  With `--extcmd` (helper short path) the whole run costs the same as a no-op tool. Not
+  ours to fix; `-d` and `git dv` avoid it entirely.
+- Dock icon install is 12 ms on the main thread after the first presented frame.
+
 ## Remaining / ideas
 
 - Borderless window with custom title bar (~22 ms faster cold start; not needed for the 200 ms target)

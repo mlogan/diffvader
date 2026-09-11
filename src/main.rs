@@ -322,7 +322,15 @@ fn parse_args() -> Result<Options, String> {
                 let remote = PathBuf::from(value("--difftool")?);
                 let base = args.next();
                 match difftool::invocation(&local, &remote, base.as_deref()) {
-                    Ok(difftool::Outcome::Done) => std::process::exit(0),
+                    Ok(difftool::Outcome::Done) => {
+                        if std::env::var_os("DIFFVADER_TIMING").is_some() {
+                            eprintln!(
+                                "diffvader:   difftool: exiting at {:.1} ms",
+                                trace::elapsed_us() as f64 / 1000.0
+                            );
+                        }
+                        std::process::exit(0)
+                    }
                     Ok(difftool::Outcome::Single) => {}
                     Err(e) => {
                         eprintln!("diffvader: difftool: {e}");

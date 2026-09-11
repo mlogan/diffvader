@@ -39,20 +39,33 @@ pub fn invocation(local: &Path, remote: &Path, base: Option<&str>) -> Result<Out
     if counter == 0 || total == 0 || local.is_dir() || remote.is_dir() {
         return Ok(Outcome::Single);
     }
-    let dir = session_dir();
+    let timing = std::env::var_os("DIFFVADER_TIMING").is_some();
+    let lap = |what: &str| {
+        if timing {
+            eprintln!(
+                "diffvader:   difftool {counter}: {what} at {:.1} ms",
+                trace::elapsed_us() as f64 / 1000.0
+            );
+        }
+    };
+    lap("start");
+    let (dir, git_pids) = session_dir();
+    lap("session-dir");
     if counter == 1 {
         sweep_stale_sessions();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     } else if !dir.is_dir() || viewer_dead(&dir) {
         // The viewer quit (it removes its session directory on a clean exit) or died, so
-        // the remaining ~100 ms per file would be wasted. End the run the way Ctrl-C does:
-        // SIGINT to git difftool's process group (ours). git treats SIGINT as a quiet
-        // interruption and the shell prints nothing, unlike a non-zero helper exit, which
-        // makes git report "fatal: external diff died".
+        // the remaining ~75 ms per file would be wasted. Interrupt the run the way Ctrl-C
+        // would: SIGINT to the helper shells and the git processes above us, which git
+        // treats as a quiet interruption (no "external diff died", nothing from the
+        // shell). Nothing beyond git is signaled, so a script wrapping it survives.
         let _ = std::fs::remove_dir_all(&dir);
-        unsafe {
-            libc::kill(0, libc::SIGINT);
+        for pid in git_pids {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGINT);
+            }
         }
         std::process::exit(130);
     }
@@ -69,7 +82,9 @@ pub fn invocation(local: &Path, remote: &Path, base: Option<&str>) -> Result<Out
                 .unwrap_or_default()
         });
     let a = keep_side(local, &dir, counter, 'a')?;
+    lap("copied-left");
     let b = keep_side(remote, &dir, counter, 'b')?;
+    lap("copied-right");
     let record = Record {
         rel,
         left: a,
@@ -83,11 +98,18 @@ pub fn invocation(local: &Path, remote: &Path, base: Option<&str>) -> Result<Out
             .map_err(|e| format!("manifest: {e}"))?;
         writeln!(f, "{}", record.encode()).map_err(|e| format!("manifest: {e}"))?;
     }
+    lap("manifest");
     if counter == total {
         let _ = std::fs::File::create(dir.join("done"));
     }
-    if counter == 1 {
+    if counter == 1 && std::env::var_os("DIFFVADER_NO_VIEWER").is_none() {
         spawn_viewer(&dir)?;
+    }
+    if std::env::var_os("DIFFVADER_TIMING").is_some() {
+        eprintln!(
+            "diffvader: difftool invocation {counter}/{total} done {:.1} ms after process start",
+            trace::elapsed_us() as f64 / 1000.0
+        );
     }
     Ok(Outcome::Done)
 }
@@ -156,28 +178,47 @@ fn keep_side(p: &Path, dir: &Path, n: usize, tag: char) -> Result<Option<PathBuf
 }
 
 /// The nearest `git` ancestor identifies one `git difftool` run: each file gets fresh
-/// shells, but they all descend from the same `git diff` process.
-fn session_dir() -> PathBuf {
-    let mut pid = std::process::id();
-    let mut git_pid = None;
+/// shells, but they all descend from the same git process. Also returns the ancestors up
+/// to and including the git ones (helper shells first), for interrupting the run.
+fn session_dir() -> (PathBuf, Vec<u32>) {
+    let mut chain: Vec<(u32, String)> = Vec::new();
+    let mut key = None;
+    let mut cur = unsafe { libc::getppid() } as u32;
     for _ in 0..8 {
-        let Some((ppid, name)) = parent_of(pid) else {
+        if cur <= 1 {
+            break;
+        }
+        let Some((ppid, name)) = process_info(cur) else {
             break;
         };
-        if ppid <= 1 {
+        let is_git = name == "git";
+        if !is_git && key.is_some() {
             break;
         }
-        if name == "git" {
-            git_pid = Some(ppid);
-            break;
+        if is_git && key.is_none() {
+            key = Some(cur);
         }
-        pid = ppid;
+        chain.push((cur, name));
+        cur = ppid;
     }
-    let key = git_pid.unwrap_or_else(|| unsafe { libc::getppid() } as u32);
-    std::env::temp_dir().join(format!("diffvader-difftool-{key}"))
+    if std::env::var_os("DIFFVADER_TIMING").is_some() {
+        let desc: Vec<String> = chain.iter().map(|(p, n)| format!("{p}({n})")).collect();
+        eprintln!("diffvader: difftool ancestors: {}", desc.join(" <- "));
+    }
+    let ancestors = if key.is_some() {
+        chain.into_iter().map(|(p, _)| p).collect()
+    } else {
+        Vec::new()
+    };
+    let key = key.unwrap_or_else(|| unsafe { libc::getppid() } as u32);
+    (
+        std::env::temp_dir().join(format!("diffvader-difftool-{key}")),
+        ancestors,
+    )
 }
 
-fn parent_of(pid: u32) -> Option<(u32, String)> {
+/// (parent pid, command name) of `pid`.
+fn process_info(pid: u32) -> Option<(u32, String)> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     let n = unsafe {

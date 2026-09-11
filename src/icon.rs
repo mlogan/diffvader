@@ -24,3 +24,25 @@ pub fn install() {
     // Safety: plain AppKit setter called on the main thread with a valid image.
     unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
 }
+
+/// Paints the NSWindow itself in the theme background. AppKit shows the window before our
+/// first frame is presented (~90 ms on this machine), and its default gray would flash.
+pub fn set_window_background(window: &winit::window::Window, color: u32) {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return;
+    };
+    let [r, g, b, _] = crate::theme::to_f64(color);
+    // Safety: ns_view is a live NSView for as long as `window` exists; called on the main
+    // thread, where winit created it.
+    unsafe {
+        let view: &objc2_app_kit::NSView = h.ns_view.cast().as_ref();
+        if let Some(ns_window) = view.window() {
+            let c = objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
+            ns_window.setBackgroundColor(Some(&c));
+        }
+    }
+}

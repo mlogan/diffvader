@@ -555,6 +555,9 @@ impl App {
             Action::ToggleTheme => {
                 self.dark = !self.dark;
                 self.theme = if self.dark { theme::DARK } else { theme::LIGHT };
+                if let Some(w) = &self.window {
+                    crate::icon::set_window_background(w, self.theme.bg);
+                }
             }
             Action::ToggleHelp => self.help = !self.help,
             Action::Quit => el.exit(),
@@ -2192,6 +2195,7 @@ impl ApplicationHandler<()> for App {
             }
         };
         drop(_s);
+        crate::icon::set_window_background(&window, self.theme.bg);
         self.scale = window.scale_factor();
         self.rebuild_font();
         let core = {
