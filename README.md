@@ -7,6 +7,15 @@ Cold start to a rendered diff is ~150 ms; scrolling a 2 MB file costs under 1 ms
 
 ## Install
 
+With Homebrew:
+
+```
+brew install mlogan/diffvader/diffvader
+diffvader --install-git
+```
+
+Or from source:
+
 ```
 git clone https://github.com/mlogan/diffvader.git
 cd diffvader
@@ -14,8 +23,8 @@ cd diffvader
 ```
 
 `install.sh` builds a release binary into `~/.cargo/bin` (needs a Rust toolchain from
-[rustup](https://rustup.rs)) and configures git: a `git dv` alias, a `git dvs` alias and
-`diff.tool = diffvader`.
+[rustup](https://rustup.rs)) and runs `diffvader --install-git`, which configures git:
+a `git dv` alias, a `git dvs` alias and `diff.tool = diffvader`.
 
 ## Use
 
