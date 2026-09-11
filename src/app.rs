@@ -2391,7 +2391,14 @@ fn build_frame(app: &mut App, lay: &Layout) {
             let rows = &l.diff.rows;
             let end = (first_row + lay.rows_visible + 1).min(rows.len());
 
-            // Row backgrounds, hunk bars and line numbers (full-window batch).
+            // Row backgrounds, hunk bars and line numbers, clipped to the text area so a
+            // partial last row does not spill onto the panel or status bar.
+            p.draw.begin([
+                0,
+                lay.text_top as u32,
+                lay.scrollbar_x as u32,
+                lay.text_h as u32,
+            ]);
             let digits = ((lay.gutter_w - 4.0 * s) / cell_w) as usize;
             let mut num_buf = String::new();
             for idx in first_row..end {
@@ -2464,6 +2471,7 @@ fn build_frame(app: &mut App, lay: &Layout) {
             }
 
             // Scrollbar: change ticks in the track, thumb on top.
+            p.draw.begin(full);
             let n = rows.len().max(1) as f32;
             if l.diff.hunks.len() <= 20_000 {
                 for h in &l.diff.hunks {
