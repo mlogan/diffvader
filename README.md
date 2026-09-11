@@ -69,7 +69,7 @@ handy when git launches the tool.
 | `h` `l` `0` `$` `←` `→` | horizontal scroll |
 | `⌘P` `:e` | quick-open file picker |
 | `]f` `[f` `:n` `:N` | next / previous file |
-| `⌥↓` `⌥↑` | browse files: the list opens with the neighbor selected, release `⌥` to open it |
+| `⌘↓` `⌘↑` | browse files: the list opens with the neighbor selected, release `⌘` to open it |
 | `/pattern` `n` `N` | search both sides (smart case) |
 | `w` or `:ws exact\|eol\|change\|all` | cycle / set whitespace mode (re-diffs in the background) |
 | `+` `-` `⌘=` `⌘-` `⌘0` | zoom |

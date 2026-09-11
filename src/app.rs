@@ -105,7 +105,7 @@ struct Picker {
     selected: usize,
     scroll: usize,
     results: Vec<PickResult>,
-    /// Opened with ⌥↑/⌥↓: the list is in file order and releasing ⌥ opens the selection.
+    /// Opened with ⌘↑/⌘↓: the list is in file order and releasing ⌘ opens the selection.
     browse: bool,
 }
 
@@ -836,8 +836,8 @@ impl App {
         self.picker = Some(p);
     }
 
-    /// ⌥↓ / ⌥↑: show the file list in order with the neighbor selected; each further press
-    /// moves one file, releasing ⌥ (or Enter) opens it.
+    /// ⌘↓ / ⌘↑: show the file list in order with the neighbor selected; each further press
+    /// moves one file, releasing ⌘ (or Enter) opens it.
     fn browse_files(&mut self, delta: i64) {
         if self.files.is_empty() {
             return;
@@ -867,7 +867,7 @@ impl App {
         }
     }
 
-    /// Called when ⌥ is released: commits a browse selection.
+    /// Called when ⌘ is released: commits a browse selection.
     fn browse_commit(&mut self) {
         let Some(p) = &self.picker else { return };
         if !p.browse {
@@ -1986,7 +1986,7 @@ fn build_frame(app: &mut App, lay: &Layout) {
         let prompt_w = p.text(bx + pad, ty, "› ", th.status_dim);
         let qw = if pk.query.is_empty() {
             let hint = if pk.browse {
-                "⌥↑ / ⌥↓ choose, release ⌥ to open"
+                "⌘↑ / ⌘↓ choose, release ⌘ to open"
             } else {
                 "type to filter files"
             };
@@ -2152,7 +2152,7 @@ const HELP_LINES: &[&str] = &[
     "  gg / G / :N          top / bottom / row N",
     "  zt / zz / zb         cursor to top / center / bottom",
     "  h / l / 0 / $        scroll horizontally",
-    "  ⌘P  or  :e           open a file (fuzzy)        ]f / [f  ⌥↓ / ⌥↑  next / previous file",
+    "  ⌘P  or  :e           open a file (fuzzy)        ]f / [f  ⌘↓ / ⌘↑  next / previous file",
     "  /pat  n  N           search (smart case)",
     "  w  or  :ws <mode>    cycle whitespace: exact, eol, change, all",
     "  + / -  (⌘= / ⌘-)     zoom      t  toggle light/dark",
@@ -2267,7 +2267,7 @@ impl ApplicationHandler<()> for App {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
-                if !self.modifiers.alt_key() {
+                if !self.modifiers.super_key() {
                     self.browse_commit();
                     if let Some(w) = &self.window {
                         w.request_redraw();
@@ -2281,13 +2281,12 @@ impl ApplicationHandler<()> for App {
                 trace::mark("key");
                 let ctrl = self.modifiers.control_key();
                 let cmd = self.modifiers.super_key();
-                let alt = self.modifiers.alt_key();
                 let arrow = match event.logical_key {
                     Key::Named(NamedKey::ArrowDown) => Some(1),
                     Key::Named(NamedKey::ArrowUp) => Some(-1),
                     _ => None,
                 };
-                if let (true, Some(d)) = (alt, arrow) {
+                if let (true, Some(d)) = (cmd, arrow) {
                     self.browse_files(d);
                 } else if self.picker.is_some() {
                     self.picker_key(&event.logical_key, ctrl, cmd);
