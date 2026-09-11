@@ -110,7 +110,7 @@ diff frame. `DIFFVADER_EXIT_AFTER_MS=N` exits cleanly (writing traces) after N m
   ours to fix; `-d` and `git dv` avoid it entirely.
 - Dock icon install is 12 ms on the main thread after the first presented frame.
 
-## AI explanations (in progress, 2026-09-11)
+## AI explanations (2026-09-11)
 
 Ask an AI agent CLI to explain the purpose of one change. Branch `mlogan-explain-hunk`.
 
@@ -129,11 +129,15 @@ Design:
 - Agent children are tracked and killed on exit; runs time out after 3 minutes.
 
 Progress:
-- [ ] explain.rs: discovery, prompt, excerpt, runner, wrap (+ tests)
-- [ ] app.rs: state, actions, panel, gutter icon, click
-- [ ] keys.rs / main.rs / files.rs / git.rs wiring
-- [ ] docs: USAGE.md, README, help overlay
-- [ ] tested end to end with claude
+- [x] explain.rs: discovery, prompt, excerpt, runner, wrap (+ tests)
+- [x] app.rs: state, actions, panel, gutter icon, click
+- [x] keys.rs / main.rs / files.rs / git.rs wiring
+- [x] docs: USAGE.md, README, help overlay
+- [x] tested end to end with claude: first pass (haiku) 16 s, expansion 11 s on this
+      repo's `--show 5dfb9b7 -- src/app.rs`. Headless: `DIFFVADER_KEYS="e,E"` with
+      `--screenshot` (the comma waits for the pending answer). Note that `--show` /
+      `--git` take every following argument, so put options before them.
+- [ ] not tested: codex and gemini command lines (neither is installed here)
 
 ## Remaining / ideas
 
