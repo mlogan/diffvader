@@ -5,11 +5,12 @@ Built to be used as a `git difftool`.
 
 ```
 cargo build --release
-./target/release/diffvader --install-git      # sets diff.tool=diffvader in ~/.gitconfig
+./target/release/diffvader --install-git      # adds a `git dv` alias and sets diff.tool
 
-diffvader --git HEAD~3                        # every file changed since HEAD~3, one at a time
-diffvader --git                               # unstaged changes (any `git diff` arguments work)
-git difftool HEAD~3                           # one file per window, through git
+git dv HEAD~3                                 # every file changed since HEAD~3, one window
+git dv                                        # unstaged changes (any `git diff` arguments work)
+diffvader --git HEAD~3                        # the same without the alias
+git difftool HEAD~3                           # one window per file; slower (see below)
 diffvader old.rs new.rs                       # two files
 diffvader tree-a/ tree-b/                     # two directory trees (git difftool -d)
 ```
@@ -93,9 +94,11 @@ Measured on an M-series Mac Studio, release build, `--timing`:
 
 - Load, index and diff run on a background thread started before the window exists.
   A 2.2 MB / 80k-line C file pair with 110k changed lines diffs in ~27 ms; typical source
-  files take 1-3 ms. This work fully overlaps AppKit startup. `diffvader --git` with 341
-  changed files reaches its first frame in the same ~150 ms as a two-file diff; `git
-  difftool -d` would spend 250-400 ms writing temp trees before the tool even starts.
+  files take 1-3 ms. This work fully overlaps AppKit startup. `git dv` with 341 changed
+  files reaches its first frame in the same ~150 ms as a two-file diff.
+- `git difftool` is inherently slower because git does work before the tool starts:
+  ~65 ms per file of shell-helper and temp-file setup in per-file mode (plus a fresh viewer
+  per file), or 250-400 ms of temp-tree writing for 341 files in `-d` mode. Prefer `git dv`.
 - Frame cost (build draw list + upload + render, GPU complete) is ~0.7-0.9 ms median and
   ~6 ms worst case on those files, independent of file size: only visible rows are touched
   and intra-line diffs are computed lazily and cached.

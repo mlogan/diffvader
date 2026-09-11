@@ -42,7 +42,7 @@ options:
       --quit-after-first-frame exit as soon as the diff is on screen (for benchmarking)
       --bench-scroll N         scroll through the diff in N frames, print stats, exit
       --git-config             print the git config needed to use diffvader as a difftool
-      --install-git            write that config to ~/.gitconfig (git config --global)
+      --install-git            write that config to ~/.gitconfig, including a `git dv` alias
   -h, --help                   show this help
   -V, --version                show version
 
@@ -352,13 +352,14 @@ fn exe_path() -> String {
 fn git_config_snippet() -> String {
     let exe = exe_path();
     format!(
-        "[diff]\n\ttool = diffvader\n[difftool]\n\tprompt = false\n[difftool \"diffvader\"]\n\tcmd = {exe} \"$LOCAL\" \"$REMOTE\"\n\n# then: git difftool [<commit>...]    (or, without config: diffvader --git [<commit>...])\n"
+        "[alias]\n\tdv = !{exe} --git\n[diff]\n\ttool = diffvader\n[difftool]\n\tprompt = false\n[difftool \"diffvader\"]\n\tcmd = {exe} \"$LOCAL\" \"$REMOTE\"\n\n# `git dv [<git diff args>]` is the fast path (no temp files, one window for all files);\n# `git difftool` also works but pays git's per-file setup cost.\n"
     )
 }
 
 fn install_git() {
     let exe = exe_path();
     let settings = [
+        ("alias.dv", format!("!{exe} --git")),
         ("diff.tool", "diffvader".to_string()),
         ("difftool.prompt", "false".to_string()),
         (
@@ -382,5 +383,5 @@ fn install_git() {
             }
         }
     }
-    println!("done. run `git difftool` (or `diffvader --git HEAD~1`) to use it.");
+    println!("done. `git dv [<git diff args>]` is the fast path; `git difftool` also works.");
 }
