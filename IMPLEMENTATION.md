@@ -56,9 +56,9 @@ src/app.rs    winit handler: layout, scrolling, draw-list construction, status b
 
 Cold start to first diff frame ~140 ms. Breakdown: dyld ~15, `NSApplication
 sharedApplication` ~40, `[NSApp run]` -> `resumed` ~25, first titled NSWindow ~40, our
-GPU surface + first frame ~3. A bare Objective-C program hits the same floor (~130 ms), so
-the <100 ms target is not reachable with a standard NSWindow here. Borderless windows init
-in ~17 ms instead of ~40 ms (measured), so a custom title bar is the one remaining lever.
+GPU surface + first frame ~3. A bare Objective-C program hits the same floor (~130 ms).
+Target (2026-09-10): sub-200 ms cold start, which this meets with margin. Borderless
+windows init in ~17 ms instead of ~40 ms (measured) if more is ever needed.
 
 Note for headless testing: when the screen is locked, `NSWindow.occlusionState` never
 reports visible and wgpu skips presenting. `--screenshot` and `--bench-scroll` render
@@ -67,7 +67,7 @@ diff frame. `DIFFVADER_EXIT_AFTER_MS=N` exits cleanly (writing traces) after N m
 
 ## Remaining / ideas
 
-- Borderless window with custom title bar (~22 ms faster cold start)
+- Borderless window with custom title bar (~22 ms faster cold start; not needed for the 200 ms target)
 - Folding long unchanged regions
 - Directory diff (`git difftool --dir-diff`)
 - Syntax highlighting (tree-sitter would hurt cold start; a lexer-based approach fits)
