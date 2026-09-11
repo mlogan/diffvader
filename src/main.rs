@@ -1,6 +1,7 @@
 mod app;
 mod diff;
 mod difftool;
+mod explain;
 mod files;
 mod font;
 mod fuzzy;
@@ -40,6 +41,8 @@ options:
       --font-size PT           font size in points (default 13)
       --tab-width N            tab stop width (default 4)
       --light                  light color theme
+      --agent NAME|CMD         AI agent for `e` (explain a change): claude, codex, gemini,
+                               or a command line; `{prompt}` marks where the prompt goes
       --timing                 print startup timeline and frame stats to stderr at exit
       --trace FILE             write Chrome trace event JSON (Perfetto / chrome://tracing)
       --screenshot FILE.bmp    render the first diff frame to a BMP file and exit
@@ -54,7 +57,8 @@ options:
 straight from git, so any `git diff` arguments work: `diffvader --git HEAD~3`,
 `diffvader --git --cached`, `diffvader --git main.. -- src/`. Two directories (what
 `git difftool --dir-diff` passes) work the same way. Files are shown one at a time; ⌘P
-opens a fuzzy file picker. Press ? inside the app for the full key list.
+opens a fuzzy file picker. `e` asks an AI agent found on PATH (or `$DIFFVADER_AGENT`)
+to explain the change under the cursor. Press ? inside the app for the full key list.
 ";
 
 fn main() {
@@ -117,6 +121,7 @@ fn main() {
                             Ok(FileSet {
                                 entries: records.iter().map(|r| r.entry()).collect(),
                                 multi: true,
+                                root: None,
                             })
                         }
                     }
@@ -126,11 +131,12 @@ fn main() {
                             Input::Show(c, rest) => git::show_args(c, rest),
                             Input::Pair(..) | Input::Session(_) => unreachable!(),
                         };
-                        git::discover(args.as_slice()).map(|(entries, reader)| {
+                        git::discover(args.as_slice()).map(|(entries, root, reader)| {
                             blobs = Some(reader);
                             FileSet {
                                 entries,
                                 multi: true,
+                                root: Some(root),
                             }
                         })
                     }
@@ -279,6 +285,7 @@ fn parse_args() -> Result<Options, String> {
     let mut tab_width = 4u32;
     let mut whitespace = WhitespaceMode::Exact;
     let mut light = false;
+    let mut agent = std::env::var("DIFFVADER_AGENT").ok();
     let mut timing = std::env::var_os("DIFFVADER_TIMING").is_some();
     let mut trace_path = std::env::var("DIFFVADER_TRACE").ok();
     let mut screenshot = None;
@@ -357,6 +364,7 @@ fn parse_args() -> Result<Options, String> {
                     .clamp(1, 16)
             }
             "--light" => light = true,
+            "--agent" => agent = Some(value("--agent")?),
             "--timing" => timing = true,
             "--trace" => trace_path = Some(value("--trace")?),
             "--screenshot" => screenshot = Some(PathBuf::from(value("--screenshot")?)),
@@ -419,6 +427,7 @@ fn parse_args() -> Result<Options, String> {
         tab_width,
         whitespace,
         light,
+        agent,
         timing,
         trace_path,
         screenshot,

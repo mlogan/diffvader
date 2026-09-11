@@ -47,6 +47,8 @@ pub struct FileSet {
     /// The session is a set of files (directory trees or git), not a single pair; the
     /// header then shows the current path and position instead of the two titles.
     pub multi: bool,
+    /// Repository root when known (git modes); tools that need the checkout run there.
+    pub root: Option<PathBuf>,
 }
 
 /// Builds the file set for two paths. Two directories are walked and paired by relative
@@ -90,6 +92,7 @@ pub fn discover(left: &Path, right: &Path, titles: (String, String)) -> Result<F
         return Ok(FileSet {
             entries,
             multi: true,
+            root: None,
         });
     }
     let exists = |p: &Path| p != Path::new("/dev/null") && p.exists();
@@ -117,6 +120,7 @@ pub fn discover(left: &Path, right: &Path, titles: (String, String)) -> Result<F
             status,
         }],
         multi: false,
+        root: None,
     })
 }
 

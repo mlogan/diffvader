@@ -9,10 +9,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use crate::files::{FileEntry, Source, Status};
 use crate::trace;
 
-/// Runs `git diff --raw <args>` and returns the entries plus a blob reader positioned in
-/// the repository. `git rev-parse` and the cat-file process start concurrently with the
-/// diff so the three git startups overlap.
-pub fn discover(args: &[String]) -> Result<(Vec<FileEntry>, BlobReader), String> {
+/// Runs `git diff --raw <args>` and returns the entries, the repository root and a blob
+/// reader positioned in the repository. `git rev-parse` and the cat-file process start
+/// concurrently with the diff so the three git startups overlap.
+pub fn discover(args: &[String]) -> Result<(Vec<FileEntry>, PathBuf, BlobReader), String> {
     let _s = trace::span("git-discover");
     let rev_parse = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -68,7 +68,7 @@ pub fn discover(args: &[String]) -> Result<(Vec<FileEntry>, BlobReader), String>
     if entries.is_empty() {
         return Err("git diff reports no changes".into());
     }
-    Ok((entries, reader))
+    Ok((entries, root, reader))
 }
 
 /// Builds `git diff` arguments showing `commit` against its first parent, as `git show`

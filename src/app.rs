@@ -15,7 +15,8 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::diff::{self, DiffResult, IntraDiff, Row, RowKind, WhitespaceMode, NONE};
-use crate::files::{FileEntry, FileSet, Status};
+use crate::explain::{self, Agent, Note, NoteState, Notes};
+use crate::files::{FileEntry, FileSet, Source, Status};
 use crate::font::{Atlas, FontSet};
 use crate::fuzzy;
 use crate::gpu::{DrawList, Gpu, GpuCore, SurfaceProblem};
@@ -44,6 +45,8 @@ pub struct Options {
     pub tab_width: u32,
     pub whitespace: WhitespaceMode,
     pub light: bool,
+    /// `--agent` / `DIFFVADER_AGENT`: a known agent name or a command line.
+    pub agent: Option<String>,
     pub timing: bool,
     pub trace_path: Option<String>,
     pub screenshot: Option<PathBuf>,
@@ -73,6 +76,8 @@ pub enum Msg {
         file: usize,
         diff: DiffResult,
     },
+    /// An agent finished (or failed) explaining one change.
+    Explained(explain::Outcome),
 }
 
 enum State {
@@ -96,6 +101,7 @@ struct FileSlot {
     state: State,
     view: View,
     stats: Option<(u32, u32)>,
+    notes: Notes,
 }
 
 struct PickResult {
@@ -168,6 +174,11 @@ pub struct App {
     bench_start: Option<Instant>,
     /// `DIFFVADER_EXIT_AFTER_MS`: exit cleanly (writing traces) at this instant.
     deadline: Option<Instant>,
+    /// Probed on the first explain request, not at startup.
+    agent: Option<Result<Agent, String>>,
+    /// Repository root (or best-effort directory) agents run in; resolved lazily.
+    root: Option<PathBuf>,
+    children: explain::Children,
 }
 
 /// Per-frame pixel geometry (physical pixels).
@@ -189,6 +200,9 @@ struct Layout {
     cols_visible: i64,
     scrollbar_x: f32,
     scrollbar_w: f32,
+    /// Explanation panel between the text area and the status bar (height 0 when hidden).
+    panel_y: f32,
+    panel_h: f32,
 }
 
 impl App {
@@ -257,6 +271,9 @@ impl App {
             bench_remaining: 0,
             bench_start: None,
             deadline: None,
+            agent: None,
+            root: None,
+            children: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -307,7 +324,14 @@ impl App {
         let header_h = (self.line_h + 8.0 * s).round();
         let status_h = (self.line_h + 8.0 * s).round();
         let text_top = header_h;
-        let text_h = (h - header_h - status_h).max(0.0);
+        let avail = (h - header_h - status_h).max(0.0);
+        let panel_h = match self.panel_content() {
+            Some((_, lines)) => ((lines.len() as f32 + 1.0) * self.line_h + 8.0 * s)
+                .min((avail * 0.45).max(2.0 * self.line_h))
+                .round(),
+            None => 0.0,
+        };
+        let text_h = (avail - panel_h).max(0.0);
         let digits = match self.loaded() {
             Some(l) => {
                 let n = l.left.line_count().max(l.right.line_count()).max(1);
@@ -341,6 +365,51 @@ impl App {
             cols_visible: (text_w / self.cell_w).floor() as i64,
             scrollbar_x: pane_x[1] + pane_w,
             scrollbar_w,
+            panel_y: text_top + text_h,
+            panel_h,
+        }
+    }
+
+    /// Text columns available to the explanation panel.
+    fn panel_cols(&self) -> usize {
+        let w = self.gpu.as_ref().map(|g| g.size().0).unwrap_or(1) as f32;
+        ((w / self.cell_w) as usize).saturating_sub(2).max(8)
+    }
+
+    /// The note for the change under the cursor, with its body wrapped for the panel. An
+    /// error is shown as the body of a failed note; a pending expansion shows the old text.
+    fn panel_content(&self) -> Option<(Note, Vec<String>)> {
+        let note = self.current_note()?.clone();
+        let body = match &note.state {
+            NoteState::Failed(e) => format!("error: {e}"),
+            _ => note.text.clone(),
+        };
+        let lines = if body.is_empty() {
+            Vec::new()
+        } else {
+            explain::wrap(&body, self.panel_cols())
+        };
+        Some((note, lines))
+    }
+
+    fn current_note(&self) -> Option<&Note> {
+        let idx = self.current_hunk()?;
+        let l = self.loaded()?;
+        let key = explain::hunk_key(&l.diff, idx);
+        self.files.get(self.current)?.notes.get(&key)
+    }
+
+    /// The panel appearing under the cursor shrinks the text area; scroll just enough to
+    /// keep the cursor row on screen.
+    fn nudge_for_panel(&mut self) {
+        let lay = self.layout();
+        if lay.panel_h <= 0.0 {
+            return;
+        }
+        let first = self.first_row();
+        let so = self.scrolloff(&lay);
+        if self.cursor + so >= first + lay.rows_visible {
+            self.set_first_row((self.cursor + so + 1) as i64 - lay.rows_visible as i64);
         }
     }
 
@@ -474,7 +543,7 @@ impl App {
 
     // ---- actions ------------------------------------------------------------------------
 
-    fn apply(&mut self, action: Action, el: &ActiveEventLoop) {
+    fn apply(&mut self, action: Action) {
         let lay = self.layout();
         let n = self.rows().len();
         match action {
@@ -560,13 +629,246 @@ impl App {
                 }
             }
             Action::ToggleHelp => self.help = !self.help,
-            Action::Quit => el.exit(),
+            Action::Explain => self.explain(&lay, false),
+            Action::Expand => self.explain(&lay, true),
+            Action::Quit => self.want_exit = true,
             Action::Message(m) => {
                 self.message = if m.is_empty() { None } else { Some(m) };
             }
         }
         self.clamp_scroll();
         self.clamp_cursor();
+        self.nudge_for_panel();
+    }
+
+    // ---- explanations --------------------------------------------------------------------
+
+    /// `e`: explain the change under the cursor, else the first change in view without an
+    /// explanation. `E`: expand the current change's explanation by a little.
+    fn explain(&mut self, lay: &Layout, expand: bool) {
+        let Some(l) = self.loaded() else {
+            self.message = Some("nothing to explain yet".into());
+            return;
+        };
+        if l.diff.hunks.is_empty() {
+            self.message = Some("no changes in this file".into());
+            return;
+        }
+        let note_for = |idx: usize| -> Option<&Note> {
+            self.files[self.current]
+                .notes
+                .get(&explain::hunk_key(&l.diff, idx))
+        };
+        let current = self.current_hunk();
+        if expand {
+            let Some(idx) = current else {
+                self.message = Some("move onto a change first (j / k)".into());
+                return;
+            };
+            match note_for(idx).map(|n| &n.state) {
+                Some(NoteState::Done) => self.request_explanation(idx, true),
+                Some(NoteState::Pending) => self.message = Some("still explaining…".into()),
+                _ => self.message = Some("no explanation to expand yet; press e".into()),
+            }
+            return;
+        }
+        let needs = |idx: usize| {
+            matches!(
+                note_for(idx).map(|n| &n.state),
+                None | Some(NoteState::Failed(_))
+            )
+        };
+        let target = match current {
+            Some(idx) => match note_for(idx).map(|n| &n.state) {
+                None | Some(NoteState::Failed(_)) => Some(idx),
+                Some(NoteState::Pending) => {
+                    self.message = Some("still explaining…".into());
+                    return;
+                }
+                Some(NoteState::Done) => {
+                    self.message = Some("already explained; E asks for more detail".into());
+                    return;
+                }
+            },
+            None => {
+                let first = self.first_row() as u32;
+                let last = (first as usize + lay.rows_visible) as u32;
+                let lo = l.diff.hunk_at_or_before(first).unwrap_or(0);
+                (lo..l.diff.hunks.len())
+                    .take_while(|&i| l.diff.hunks[i].rows.start < last)
+                    .find(|&i| l.diff.hunks[i].rows.end > first && needs(i))
+            }
+        };
+        let Some(idx) = target else {
+            self.message = Some("every change in view is explained".into());
+            return;
+        };
+        if current != Some(idx) {
+            self.show_hunk(lay, idx);
+        }
+        self.request_explanation(idx, false);
+    }
+
+    /// Gutter icon click: put the cursor on the change; explain it, or expand an existing
+    /// explanation when the cursor was already there.
+    fn icon_click(&mut self, lay: &Layout, idx: usize) {
+        let was_current = self.current_hunk() == Some(idx);
+        self.show_hunk(lay, idx);
+        let Some(l) = self.loaded() else { return };
+        let key = explain::hunk_key(&l.diff, idx);
+        match self.files[self.current].notes.get(&key).map(|n| &n.state) {
+            None | Some(NoteState::Failed(_)) => self.request_explanation(idx, false),
+            Some(NoteState::Pending) => self.message = Some("still explaining…".into()),
+            Some(NoteState::Done) if was_current => self.request_explanation(idx, true),
+            Some(NoteState::Done) => {}
+        }
+    }
+
+    fn agent(&mut self) -> Result<Agent, String> {
+        if self.agent.is_none() {
+            let _s = trace::span("find-agent");
+            self.agent = Some(explain::find_agent(self.opts.agent.as_deref()));
+        }
+        self.agent.clone().unwrap()
+    }
+
+    fn root(&mut self) -> PathBuf {
+        if let Some(r) = &self.root {
+            return r.clone();
+        }
+        let _s = trace::span("repo-root");
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let hint = match &self.opts.input {
+            Input::Pair(l, r) => {
+                let pick = if r != Path::new("/dev/null") && r.exists() {
+                    r
+                } else {
+                    l
+                };
+                pick.canonicalize()
+                    .ok()
+                    .and_then(|p| p.parent().map(Path::to_path_buf))
+                    .unwrap_or(cwd)
+            }
+            _ => cwd,
+        };
+        let root = explain::repo_root(&hint);
+        self.root = Some(root.clone());
+        root
+    }
+
+    /// What the two sides of the current file are, for the prompt.
+    fn comparison(&self, entry: &FileEntry) -> String {
+        let side = |s: &Source| match s {
+            Source::Path(_) if matches!(self.opts.input, Input::Git(_) | Input::Show(..)) => {
+                "the working tree file".to_string()
+            }
+            s => explain::describe_source(s),
+        };
+        match &self.opts.input {
+            Input::Git(args) if args.is_empty() => format!(
+                "`git diff` with no arguments (the working tree against the index); old side: {}, new side: {}",
+                side(&entry.left),
+                side(&entry.right)
+            ),
+            Input::Git(args) => format!(
+                "`git diff {}`; old side: {}, new side: {}",
+                args.join(" "),
+                side(&entry.left),
+                side(&entry.right)
+            ),
+            Input::Show(commit, rest) => format!(
+                "commit {commit} against its first parent, as `git show {commit}{}` does; old side: {}, new side: {}",
+                rest.iter().map(|a| format!(" {a}")).collect::<String>(),
+                side(&entry.left),
+                side(&entry.right)
+            ),
+            Input::Pair(..) => format!(
+                "two files; old side: {}, new side: {}",
+                side(&entry.left),
+                side(&entry.right)
+            ),
+            Input::Session(_) => format!(
+                "`git difftool` temporary copies of {}; old side: {}, new side: {}; the checkout is the current directory",
+                entry.rel,
+                side(&entry.left),
+                side(&entry.right)
+            ),
+        }
+    }
+
+    fn request_explanation(&mut self, idx: usize, expand: bool) {
+        let agent = match self.agent() {
+            Ok(a) => a,
+            Err(e) => {
+                self.message = Some(format!("error: {e}"));
+                return;
+            }
+        };
+        let root = self.root();
+        let file = self.current;
+        let Some(l) = self.loaded() else { return };
+        let key = explain::hunk_key(&l.diff, idx);
+        let entry = &self.files[file].entry;
+        let previous = self.files[file].notes.get(&key);
+        let (level, previous) = if expand {
+            match previous {
+                Some(n) => (n.level + 1, Some(n.text.clone())),
+                None => (0, None),
+            }
+        } else {
+            (0, None)
+        };
+        let excerpt = explain::excerpt(&l.left, &l.right, &l.diff, idx);
+        let others: Vec<String> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != file)
+            .map(|(_, f)| f.entry.rel.clone())
+            .collect();
+        let prompt = explain::build_prompt(&explain::Context {
+            entry,
+            comparison: self.comparison(entry),
+            others: &others,
+            root: &root,
+            excerpt: &excerpt,
+            previous: previous.as_deref(),
+            level,
+        });
+        let fast = level == 0;
+        let label = agent.label(fast);
+        self.files[file].notes.insert(
+            key,
+            Note {
+                text: previous.unwrap_or_default(),
+                level,
+                state: NoteState::Pending,
+                agent: label.clone(),
+            },
+        );
+        let tx = self.tx.clone();
+        let proxy = self.proxy.clone();
+        explain::spawn(
+            agent,
+            explain::Job {
+                file,
+                key,
+                level,
+                prompt,
+                root,
+            },
+            self.children.clone(),
+            move |outcome| {
+                let _ = tx.send(Msg::Explained(outcome));
+                let _ = proxy.send_event(());
+            },
+        );
+        self.message = Some(format!(
+            "asking {label} {} change {}…",
+            if expand { "to expand on" } else { "about" },
+            idx + 1
+        ));
     }
 
     fn jump_hunk(&mut self, lay: &Layout, delta: i64) {
@@ -1029,10 +1331,21 @@ impl App {
             }
             return;
         }
-        // Click in the text area places the cursor on that row.
+        // Click in the text area places the cursor on that row; the `?` icon at the left
+        // edge of a change asks for its explanation.
         let row = self.first_row() + ((my - lay.text_top) / self.line_h) as usize;
         if row < self.rows().len() {
             self.cursor = row;
+            let on_icon =
+                mx >= lay.pane_x[0] && mx < lay.pane_x[0] + 4.0 * self.scale as f32 + self.cell_w;
+            let hunk = self
+                .loaded()
+                .and_then(|l| l.diff.hunk_at_or_before(row as u32))
+                .filter(|&i| self.hunks()[i].rows.start as usize == row);
+            if let (true, Some(i)) = (on_icon, hunk) {
+                self.icon_click(&lay, i);
+                self.nudge_for_panel();
+            }
         }
     }
 
@@ -1054,6 +1367,7 @@ impl App {
                 Msg::Files(Ok(set)) => {
                     trace::mark("files-received");
                     self.dir_mode = set.multi;
+                    self.root = set.root;
                     self.files = set
                         .entries
                         .into_iter()
@@ -1062,6 +1376,7 @@ impl App {
                             state: State::Loading,
                             view: View::default(),
                             stats: None,
+                            notes: Notes::new(),
                         })
                         .collect();
                     self.current = 0;
@@ -1075,6 +1390,7 @@ impl App {
                         state: State::Loading,
                         view: View::default(),
                         stats: None,
+                        notes: Notes::new(),
                     }));
                     self.update_title();
                 }
@@ -1139,6 +1455,31 @@ impl App {
                     let lay = self.layout();
                     self.clamp_cursor_to_view(&lay);
                 }
+                Msg::Explained(o) => {
+                    let Some(slot) = self.files.get_mut(o.file) else {
+                        continue;
+                    };
+                    let Some(note) = slot.notes.get_mut(&o.key) else {
+                        continue;
+                    };
+                    // A newer request for the same change supersedes this answer.
+                    if note.level != o.level || note.state != NoteState::Pending {
+                        continue;
+                    }
+                    let secs = o.elapsed.as_secs_f64();
+                    match o.result {
+                        Ok(text) => {
+                            note.text = text;
+                            note.state = NoteState::Done;
+                            self.message = Some(format!("explained in {secs:.1} s"));
+                        }
+                        Err(e) => {
+                            self.message = Some(format!("error: {e}"));
+                            note.state = NoteState::Failed(e);
+                        }
+                    }
+                    self.nudge_for_panel();
+                }
             }
         }
     }
@@ -1155,13 +1496,28 @@ impl App {
         let frame_start = Instant::now();
         let _s = trace::span("frame");
         let has_diff = matches!(self.state(), State::Ready(_) | State::Failed(_));
-        // Debug aid: `DIFFVADER_PICKER=query` opens the picker before a `--screenshot`.
+        // Debug aids for `--screenshot`: `DIFFVADER_PICKER=query` opens the picker,
+        // `DIFFVADER_KEYS=chars` feeds keys through the normal handler on the first diff
+        // frame; the screenshot then waits for any explanation those keys requested.
         if has_diff && !self.first_diff_frame_done && self.opts.screenshot.is_some() {
             if let Ok(q) = std::env::var("DIFFVADER_PICKER") {
                 self.open_picker();
                 for ch in q.chars() {
                     let key = Key::Character(ch.to_string().into());
                     self.picker_key(&key, false, false);
+                }
+            }
+            if let Ok(keys) = std::env::var("DIFFVADER_KEYS") {
+                for ch in keys.chars() {
+                    let key = Key::Character(ch.to_string().into());
+                    let input = KeyInput {
+                        key: &key,
+                        ctrl: false,
+                        cmd: false,
+                    };
+                    if let Some(action) = self.vi.key(input) {
+                        self.apply(action);
+                    }
                 }
             }
         }
@@ -1199,14 +1555,6 @@ impl App {
             // window being visible (see the presented mark below).
             self.first_diff_frame_done = true;
             trace::mark("first-diff-frame");
-            if let Some(path) = self.opts.screenshot.clone() {
-                let (w, h, rgba) = gpu.render_to_image(&self.draw, clear);
-                match write_bmp(&path, w, h, &rgba) {
-                    Ok(()) => eprintln!("diffvader: wrote screenshot {}", path.display()),
-                    Err(e) => eprintln!("diffvader: screenshot failed: {e}"),
-                }
-                self.want_exit = true;
-            }
             if self.opts.quit_after_first_frame {
                 self.want_exit = true;
             }
@@ -1214,6 +1562,22 @@ impl App {
                 self.bench_remaining = n;
                 self.bench_start = Some(Instant::now());
                 window.request_redraw();
+            }
+        }
+        if has_diff && !self.want_exit {
+            if let Some(path) = self.opts.screenshot.clone() {
+                let pending = self
+                    .files
+                    .iter()
+                    .any(|f| f.notes.values().any(|n| n.state == NoteState::Pending));
+                if !pending {
+                    let (w, h, rgba) = gpu.render_to_image(&self.draw, clear);
+                    match write_bmp(&path, w, h, &rgba) {
+                        Ok(()) => eprintln!("diffvader: wrote screenshot {}", path.display()),
+                        Err(e) => eprintln!("diffvader: screenshot failed: {e}"),
+                    }
+                    self.want_exit = true;
+                }
             }
         }
         match gpu.render(&self.draw, clear) {
@@ -1305,6 +1669,7 @@ impl App {
     }
 
     fn finish(&mut self) {
+        explain::kill_children(&self.children);
         trace::run_exit_hook();
     }
 }
@@ -1574,6 +1939,7 @@ fn build_frame(app: &mut App, lay: &Layout) {
     let full = [0, 0, lay.w as u32, lay.h as u32];
     let (thumb_y, thumb_h) = app.thumb(lay);
     let cur_hunk: Option<Range<u32>> = app.current_hunk().map(|i| app.hunks()[i].rows.clone());
+    let panel = app.panel_content();
 
     // Pre-compute intra-line diffs for visible modify rows (needs &mut app).
     let mut intra: Vec<(usize, Option<IntraDiff>)> = Vec::new();
@@ -1734,6 +2100,21 @@ fn build_frame(app: &mut App, lay: &Layout) {
                 }
                 if in_cur || (cur_hunk.is_none() && idx == cursor) {
                     p.rect(0.0, y, lay.scrollbar_x, line_h, th.cursor_row);
+                }
+                // Explain icon on the first row of each change, in the gutter's leading cell.
+                let hunk_start = l
+                    .diff
+                    .hunk_at_or_before(idx as u32)
+                    .filter(|&i| l.diff.hunks[i].rows.start as usize == idx);
+                if let Some(i) = hunk_start {
+                    let note = slot.and_then(|f| f.notes.get(&explain::hunk_key(&l.diff, i)));
+                    let (glyph, color) = match note.map(|n| &n.state) {
+                        None => ('?', th.gutter_fg),
+                        Some(NoteState::Pending) => ('…', th.status_accent),
+                        Some(NoteState::Done) => ('•', th.status_accent),
+                        Some(NoteState::Failed(_)) => ('!', th.error_fg),
+                    };
+                    p.glyph(lay.pane_x[0] + 4.0 * s, y, glyph, color);
                 }
             }
 
@@ -1966,6 +2347,65 @@ fn build_frame(app: &mut App, lay: &Layout) {
         p.text(center_x, status_y, &ws_text, th.status_dim);
     }
 
+    // ---- explanation panel ----
+    if let Some((note, lines)) = &panel {
+        let py = lay.panel_y;
+        p.draw.begin(full);
+        p.rect(0.0, py, lay.w, lay.panel_h, th.picker_bg);
+        p.rect(0.0, py, lay.w, (1.0 * s).round(), th.picker_border);
+        let pad = cell_w;
+        let mut y = py + 4.0 * s;
+        let (title, color, hint) = match &note.state {
+            NoteState::Pending if note.text.is_empty() => (
+                format!("explaining with {}…", note.agent),
+                th.status_dim,
+                "",
+            ),
+            NoteState::Pending => (format!("expanding with {}…", note.agent), th.status_dim, ""),
+            NoteState::Done => (
+                format!("explanation · {} · pass {}", note.agent, note.level + 1),
+                th.status_accent,
+                "E  more detail",
+            ),
+            NoteState::Failed(_) => (
+                format!("explanation failed · {}", note.agent),
+                th.error_fg,
+                "e  retry",
+            ),
+        };
+        p.text(pad, y, &title, color);
+        if !hint.is_empty() {
+            let hw = p.text_width(hint);
+            p.text(lay.w - hw - pad, y, hint, th.status_dim);
+        }
+        y += line_h;
+        let max_lines = ((py + lay.panel_h - y - 2.0 * s) / line_h).floor() as usize;
+        let body_color = match note.state {
+            NoteState::Pending => th.status_dim,
+            _ => th.fg,
+        };
+        for (i, line) in lines.iter().take(max_lines).enumerate() {
+            p.text(pad, y + i as f32 * line_h, line, body_color);
+        }
+        if lines.len() > max_lines && max_lines > 0 {
+            let more = format!("… {} more lines", lines.len() - max_lines);
+            let mw = p.text_width(&more);
+            p.rect(
+                lay.w - mw - 2.0 * pad,
+                y + (max_lines - 1) as f32 * line_h,
+                mw + 2.0 * pad,
+                line_h,
+                th.picker_bg,
+            );
+            p.text(
+                lay.w - mw - pad,
+                y + (max_lines - 1) as f32 * line_h,
+                &more,
+                th.status_dim,
+            );
+        }
+    }
+
     // ---- quick-open picker ----
     if let Some(pk) = picker {
         let box_w = (lay.w * 0.6).min(110.0 * cell_w).max(30.0 * cell_w);
@@ -2159,6 +2599,8 @@ const HELP_LINES: &[&str] = &[
     "  ⌘P  or  :e           open a file (fuzzy)        ]f / [f  ⌘↓ / ⌘↑  next / previous file",
     "  /pat  n  N           search (smart case)",
     "  w  or  :ws <mode>    cycle whitespace: exact, eol, change, all",
+    "  e / E               explain this change with an AI agent / ask for more detail",
+    "                       (or click the ? in the gutter)",
     "  + / -  (⌘= / ⌘-)     zoom      t  toggle light/dark",
     "  q  ZZ  :q            quit      ?  show this help (any key closes it)",
 ];
@@ -2308,8 +2750,12 @@ impl ApplicationHandler<()> for App {
                         self.message = None;
                     }
                     if let Some(action) = self.vi.key(input) {
-                        self.apply(action, el);
+                        self.apply(action);
                     }
+                }
+                if self.want_exit {
+                    el.exit();
+                    return;
                 }
                 if let Some(w) = &self.window {
                     w.request_redraw();

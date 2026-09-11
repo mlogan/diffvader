@@ -44,6 +44,10 @@ pub enum Action {
     ZoomReset,
     ToggleTheme,
     ToggleHelp,
+    /// Ask the agent about the change under the cursor (or the first unexplained one in view).
+    Explain,
+    /// Ask for a slightly longer explanation of the current change.
+    Expand,
     Quit,
     /// A message for the status bar (e.g. an unknown `:` command).
     Message(String),
@@ -257,6 +261,8 @@ impl Vi {
             'n' => Action::SearchNext(self.take_count()),
             'N' => Action::SearchPrev(self.take_count()),
             'w' => Action::CycleWhitespace,
+            'e' => Action::Explain,
+            'E' => Action::Expand,
             't' => Action::ToggleTheme,
             'q' => Action::Quit,
             '?' => Action::ToggleHelp,
@@ -377,6 +383,8 @@ fn run_command(cmd: &str) -> Action {
             other => Action::Message(format!("unknown option: {other}")),
         },
         "h" | "help" => Action::ToggleHelp,
+        "explain" | "ex" => Action::Explain,
+        "expand" | "more" => Action::Expand,
         "n" | "next" => Action::NextFile(1),
         "N" | "prev" | "previous" => Action::PrevFile(1),
         "e" | "edit" | "files" | "f" => Action::OpenPicker,
@@ -432,6 +440,8 @@ mod tests {
         assert_eq!(press(&mut vi, 'c'), Some(Action::PrevHunk(3)));
         assert_eq!(press(&mut vi, 'Z'), None);
         assert_eq!(press(&mut vi, 'Z'), Some(Action::Quit));
+        assert_eq!(press(&mut vi, 'e'), Some(Action::Explain));
+        assert_eq!(press(&mut vi, 'E'), Some(Action::Expand));
     }
 
     #[test]
