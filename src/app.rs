@@ -174,6 +174,8 @@ pub struct App {
     bench_start: Option<Instant>,
     /// `DIFFVADER_EXIT_AFTER_MS`: exit cleanly (writing traces) at this instant.
     deadline: Option<Instant>,
+    /// `DIFFVADER_KEYS` not yet fed (see `render`).
+    debug_keys: String,
     /// Probed on the first explain request, not at startup.
     agent: Option<Result<Agent, String>>,
     /// Repository root (or best-effort directory) agents run in; resolved lazily.
@@ -227,6 +229,11 @@ impl App {
         };
         let atlas = Atlas::new(opts.font_pt * 2.0, 1.0, 1.0, 1.0);
         let dark = !opts.light;
+        let debug_keys = if opts.screenshot.is_some() {
+            std::env::var("DIFFVADER_KEYS").unwrap_or_default()
+        } else {
+            String::new()
+        };
         Ok(App {
             theme: if dark { theme::DARK } else { theme::LIGHT },
             dark,
@@ -271,6 +278,7 @@ impl App {
             bench_remaining: 0,
             bench_start: None,
             deadline: None,
+            debug_keys,
             agent: None,
             root: None,
             children: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1498,26 +1506,37 @@ impl App {
         let has_diff = matches!(self.state(), State::Ready(_) | State::Failed(_));
         // Debug aids for `--screenshot`: `DIFFVADER_PICKER=query` opens the picker,
         // `DIFFVADER_KEYS=chars` feeds keys through the normal handler on the first diff
-        // frame; the screenshot then waits for any explanation those keys requested.
+        // frame; a `,` in the keys waits for pending explanations first, and the screenshot
+        // waits for the last of them.
+        let pending = self
+            .files
+            .iter()
+            .any(|f| f.notes.values().any(|n| n.state == NoteState::Pending));
+        if has_diff && !pending && !self.debug_keys.is_empty() {
+            let keys = std::mem::take(&mut self.debug_keys);
+            let (now, later) = match keys.split_once(',') {
+                Some((a, b)) => (a.to_string(), b.to_string()),
+                None => (keys, String::new()),
+            };
+            self.debug_keys = later;
+            for ch in now.chars() {
+                let key = Key::Character(ch.to_string().into());
+                let input = KeyInput {
+                    key: &key,
+                    ctrl: false,
+                    cmd: false,
+                };
+                if let Some(action) = self.vi.key(input) {
+                    self.apply(action);
+                }
+            }
+        }
         if has_diff && !self.first_diff_frame_done && self.opts.screenshot.is_some() {
             if let Ok(q) = std::env::var("DIFFVADER_PICKER") {
                 self.open_picker();
                 for ch in q.chars() {
                     let key = Key::Character(ch.to_string().into());
                     self.picker_key(&key, false, false);
-                }
-            }
-            if let Ok(keys) = std::env::var("DIFFVADER_KEYS") {
-                for ch in keys.chars() {
-                    let key = Key::Character(ch.to_string().into());
-                    let input = KeyInput {
-                        key: &key,
-                        ctrl: false,
-                        cmd: false,
-                    };
-                    if let Some(action) = self.vi.key(input) {
-                        self.apply(action);
-                    }
                 }
             }
         }
@@ -1570,7 +1589,7 @@ impl App {
                     .files
                     .iter()
                     .any(|f| f.notes.values().any(|n| n.state == NoteState::Pending));
-                if !pending {
+                if !pending && self.debug_keys.is_empty() {
                     let (w, h, rgba) = gpu.render_to_image(&self.draw, clear);
                     match write_bmp(&path, w, h, &rgba) {
                         Ok(()) => eprintln!("diffvader: wrote screenshot {}", path.display()),

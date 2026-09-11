@@ -30,6 +30,7 @@ diffvader [options] --show [COMMIT] [ARGS]    one commit against its parent (lik
       --font-size PT           font size in points (default 13)
       --tab-width N            tab stop width (default 4)
       --light                  light color theme
+      --agent NAME|CMD         AI agent for `e`: claude, codex, gemini, or a command line
       --timing                 print a startup timeline and frame stats to stderr at exit
       --trace FILE             write Chrome trace event JSON (open in Perfetto)
       --screenshot FILE.bmp    render the first diff frame to a BMP file and exit
@@ -74,11 +75,33 @@ handy when git launches the tool.
 | `w` or `:ws exact\|eol\|change\|all` | cycle / set whitespace mode (re-diffs in the background) |
 | `+` `-` `⌘=` `⌘-` `⌘0` | zoom |
 | `t` | toggle light / dark theme |
+| `e` `:explain` | explain the change under the cursor with an AI agent (or the first unexplained change in view) |
+| `E` `:expand` | ask for slightly more detail on the current explanation |
 | `?` | key reference overlay (any key or click closes it) |
 | `q` `ZZ` `:q` `⌘Q` `⌘W` | quit |
 
 Mouse: wheel and trackpad scroll, click a row to put the cursor there, click or drag the
-scrollbar on the right (its ticks mark every change).
+scrollbar on the right (its ticks mark every change). The `?` at the left edge of each
+change asks for its explanation; clicking it again once the answer is in asks for more.
+
+## AI explanations
+
+`e` asks an AI agent CLI to explain the purpose of one change. diffvader looks for
+`claude`, `codex` and `gemini` on PATH (in that order) the first time you press it, or
+uses `--agent` / `$DIFFVADER_AGENT`, which take a known name or a full command line
+(`{prompt}` marks where the prompt goes; without it the prompt is the last argument).
+The agent runs in the repository root and may read files and run `git log` / `git show`.
+
+The prompt carries the change as a unified diff with context, the file, what the two
+sides are (the `git diff` arguments, the commit for `git dvs`, or the two paths), the
+other files in the same comparison, and instructions to be concise and factual, avoid
+metaphors and jargon, and explain in cause-and-effect terms. The first pass runs on the
+agent's fastest model (`claude --model haiku`) and is limited to a few sentences; `E`
+re-sends the previous text on the agent's default model and asks for a little more.
+
+Answers appear in a panel above the status bar whenever the cursor is on an explained
+change; the gutter icon shows `…` while the agent works, `•` when done and `!` on an
+error. Agents still running when you quit are terminated.
 
 ## What the colors mean
 
