@@ -191,7 +191,9 @@ fn main() {
         let mut builder = EventLoop::<()>::with_user_event();
         builder
             .with_activation_policy(ActivationPolicy::Regular)
-            .with_default_menu(true)
+            // No default menu: its Quit item calls terminate:, which exits inside an event
+            // dispatch and skips all cleanup. ⌘Q is handled as a key instead.
+            .with_default_menu(false)
             .with_activate_ignoring_other_apps(true);
         builder.build().expect("create event loop")
     };
@@ -199,6 +201,9 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let _ = proxy_tx.send(proxy.clone());
 
+    let app_input = opts.input.clone();
+    let app_trace_path = opts.trace_path.clone();
+    let app_timing = opts.timing;
     let mut app = match App::new(opts, rx, tx, proxy.clone(), wanted, font_thread, gpu_thread) {
         Ok(a) => a,
         Err(e) => {
@@ -218,6 +223,17 @@ fn main() {
             let _ = proxy.send_event(());
         });
     }
+    if let Input::Session(dir) = &app_input {
+        difftool::write_viewer_pid(dir);
+    }
+    trace::register_exit_hook(
+        match &app_input {
+            Input::Session(dir) => Some(dir.clone()),
+            _ => None,
+        },
+        app_trace_path,
+        app_timing,
+    );
     trace::mark("run-app");
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("diffvader: event loop error: {e}");

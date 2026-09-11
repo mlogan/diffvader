@@ -133,6 +133,8 @@ impl Vi {
                     "-" => Some(Action::ZoomOut),
                     "0" => Some(Action::ZoomReset),
                     "p" => Some(Action::OpenPicker),
+                    // ⌘Q / ⌘W: quit through our own path, never AppKit's terminate:.
+                    "q" | "w" => Some(Action::Quit),
                     _ => None,
                 };
             }

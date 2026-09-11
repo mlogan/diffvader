@@ -77,6 +77,13 @@ GPU surface + first frame ~3. A bare Objective-C program hits the same floor (~1
 Target (2026-09-10): sub-200 ms cold start, which this meets with margin. Borderless
 windows init in ~17 ms instead of ~40 ms (measured) if more is ever needed.
 
+Quitting: ⌘Q/⌘W are handled as keys and the default menu is disabled on purpose. AppKit's
+`terminate:` (the menu's Quit item) closes windows inside the current event dispatch, which
+trips winit 0.30's "tried to handle event while another event is currently being handled"
+panic; with `panic = "abort"` that skipped every cleanup and left `git difftool` sessions
+grinding through remaining files. Cleanup also runs from an `atexit` hook, and per-file
+invocations check the viewer's pid so a dead viewer stops git within one file.
+
 Exit latency: from a key/user event to `exiting()` is ~15 ms and process teardown is
 immediate. (`--quit-after-first-frame` exits from `resumed`, before the run loop is fully
 up, which adds ~85 ms; that is a benchmark artifact, not something users see.)

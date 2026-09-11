@@ -1302,23 +1302,7 @@ impl App {
     }
 
     fn finish(&mut self) {
-        trace::mark("exiting");
-        if let Input::Session(dir) = &self.opts.input {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        if let Some(p) = &self.opts.trace_path {
-            match trace::write_chrome_trace(p) {
-                Ok(()) => eprintln!("diffvader: wrote trace to {p}"),
-                Err(e) => eprintln!("diffvader: failed to write trace {p}: {e}"),
-            }
-        }
-        if self.opts.timing {
-            trace::print_summary();
-            eprintln!(
-                "diffvader: exiting at {:.1} ms after process start",
-                trace::elapsed_us() as f64 / 1000.0
-            );
-        }
+        trace::run_exit_hook();
     }
 }
 

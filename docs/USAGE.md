@@ -75,7 +75,7 @@ handy when git launches the tool.
 | `+` `-` `⌘=` `⌘-` `⌘0` | zoom |
 | `t` | toggle light / dark theme |
 | `?` | help overlay |
-| `q` `ZZ` `:q` `⌘Q` | quit |
+| `q` `ZZ` `:q` `⌘Q` `⌘W` | quit |
 
 Mouse: wheel and trackpad scroll, click a row to put the cursor there, click or drag the
 scrollbar on the right (its ticks mark every change).

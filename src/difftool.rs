@@ -41,11 +41,16 @@ pub fn invocation(local: &Path, remote: &Path, base: Option<&str>) -> Result<Out
     }
     let dir = session_dir();
     if counter == 1 {
+        sweep_stale_sessions();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    } else if !dir.is_dir() {
-        // The viewer already quit (it removes the directory); nothing left to do.
-        return Ok(Outcome::Done);
+    } else if !dir.is_dir() || viewer_dead(&dir) {
+        // The viewer quit (it removes its session directory on a clean exit) or died.
+        // Exiting with a signal-like status makes git-difftool--helper stop instead of
+        // spending ~65 ms on each remaining file; git reports "external diff died".
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("diffvader: viewer closed, stopping git difftool");
+        std::process::exit(130);
     }
 
     let rel = base
@@ -81,6 +86,45 @@ pub fn invocation(local: &Path, remote: &Path, base: Option<&str>) -> Result<Out
         spawn_viewer(&dir)?;
     }
     Ok(Outcome::Done)
+}
+
+/// Written by the viewer at startup so later invocations can tell whether it is alive
+/// even when it died without cleaning up (crash, kill -9).
+pub fn write_viewer_pid(dir: &Path) {
+    let _ = std::fs::write(dir.join("viewer.pid"), std::process::id().to_string());
+}
+
+fn viewer_dead(dir: &Path) -> bool {
+    let Some(pid) = std::fs::read_to_string(dir.join("viewer.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+    else {
+        // Not written yet: the viewer was spawned moments ago and is still starting.
+        return false;
+    };
+    unsafe { libc::kill(pid, 0) != 0 && *libc::__error() == libc::ESRCH }
+}
+
+/// Removes session directories older than an hour that a crashed viewer left behind.
+fn sweep_stale_sessions() {
+    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for e in rd.flatten() {
+        let name = e.file_name();
+        if !name.to_string_lossy().starts_with("diffvader-difftool-") {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t < cutoff)
+            .unwrap_or(false);
+        if old {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 fn is_null(p: &Path) -> bool {

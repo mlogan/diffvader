@@ -250,3 +250,70 @@ pub fn print_summary() {
         );
     }
 }
+
+/// Work that must happen exactly once when the process ends, whatever the path: the normal
+/// `exiting` callback, or AppKit's `terminate:` (⌘Q, Dock ▸ Quit), which calls `exit()`
+/// directly and bypasses Rust destructors and winit's exit events.
+struct ExitHook {
+    session_dir: Option<std::path::PathBuf>,
+    trace_path: Option<String>,
+    timing: bool,
+    done: bool,
+}
+
+static EXIT_HOOK: Mutex<ExitHook> = Mutex::new(ExitHook {
+    session_dir: None,
+    trace_path: None,
+    timing: false,
+    done: false,
+});
+
+pub fn register_exit_hook(
+    session_dir: Option<std::path::PathBuf>,
+    trace_path: Option<String>,
+    timing: bool,
+) {
+    {
+        let mut h = EXIT_HOOK.lock().unwrap();
+        h.session_dir = session_dir;
+        h.trace_path = trace_path;
+        h.timing = timing;
+    }
+    extern "C" fn at_exit() {
+        run_exit_hook();
+    }
+    unsafe {
+        libc::atexit(at_exit);
+    }
+}
+
+/// Idempotent; safe to call from both the event loop and the atexit handler.
+pub fn run_exit_hook() {
+    let (dir, trace_path, timing) = {
+        let Ok(mut h) = EXIT_HOOK.try_lock() else {
+            return;
+        };
+        if h.done {
+            return;
+        }
+        h.done = true;
+        (h.session_dir.take(), h.trace_path.take(), h.timing)
+    };
+    mark("exiting");
+    if let Some(dir) = dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    if let Some(p) = trace_path {
+        match write_chrome_trace(&p) {
+            Ok(()) => eprintln!("diffvader: wrote trace to {p}"),
+            Err(e) => eprintln!("diffvader: failed to write trace {p}: {e}"),
+        }
+    }
+    if timing {
+        print_summary();
+        eprintln!(
+            "diffvader: exiting at {:.1} ms after process start",
+            elapsed_us() as f64 / 1000.0
+        );
+    }
+}
