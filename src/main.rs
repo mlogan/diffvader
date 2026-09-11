@@ -1,5 +1,6 @@
 mod app;
 mod diff;
+mod difftool;
 mod files;
 mod font;
 mod fuzzy;
@@ -29,6 +30,7 @@ diffvader — fast side-by-side diff viewer
 usage: diffvader [options] LEFT RIGHT [+ROW]     compare two files, or two directory trees
        diffvader [options] [--git GIT-DIFF-ARGS]  show what `git diff GIT-DIFF-ARGS` would
        diffvader [options] --show [COMMIT] [ARGS]  one commit against its parent (like git show)
+       diffvader --difftool LOCAL REMOTE [BASE]   what `git difftool` runs (see --install-git)
 
 options:
   -w, --ignore-all-space       ignore all whitespace
@@ -107,11 +109,22 @@ fn main() {
                     Input::Pair(left, right) => {
                         files::discover(left.as_path(), right.as_path(), titles)
                     }
+                    Input::Session(dir) => {
+                        let (records, _) = difftool::read_session(dir);
+                        if records.is_empty() {
+                            Err(format!("empty difftool session {}", dir.display()))
+                        } else {
+                            Ok(FileSet {
+                                entries: records.iter().map(|r| r.entry()).collect(),
+                                multi: true,
+                            })
+                        }
+                    }
                     Input::Git(_) | Input::Show(..) => {
                         let args = match &input {
                             Input::Git(a) => a.clone(),
                             Input::Show(c, rest) => git::show_args(c, rest),
-                            Input::Pair(..) => unreachable!(),
+                            Input::Pair(..) | Input::Session(_) => unreachable!(),
                         };
                         git::discover(args.as_slice()).map(|(entries, reader)| {
                             blobs = Some(reader);
@@ -129,21 +142,45 @@ fn main() {
                         return;
                     }
                 };
-                let entries: Vec<FileEntry> = set.entries.clone();
+                let mut entries: Vec<FileEntry> = set.entries.clone();
                 notify(Msg::Files(Ok(set)));
-                // Load the file the UI wants first, then the rest in order.
-                let n = entries.len();
-                let mut done = vec![false; n];
-                for _ in 0..n {
+                // Load the file the UI wants first, then the rest in order. A difftool
+                // session keeps growing while git runs, so poll it until it is complete.
+                let session = match &input {
+                    Input::Session(dir) => Some(dir.clone()),
+                    _ => None,
+                };
+                let mut complete = session.is_none();
+                let mut done = vec![false; entries.len()];
+                loop {
                     let w = wanted.load(Ordering::Relaxed);
-                    let i = if w < n && !done[w] {
-                        w
+                    let next = if w < entries.len() && !done[w] {
+                        Some(w)
                     } else {
-                        done.iter().position(|d| !d).unwrap()
+                        done.iter().position(|d| !d)
                     };
-                    let result = load_pair(&entries[i], mode, &mut blobs);
-                    done[i] = true;
-                    notify(Msg::Loaded { file: i, result });
+                    if let Some(i) = next {
+                        let result = load_pair(&entries[i], mode, &mut blobs);
+                        done[i] = true;
+                        notify(Msg::Loaded { file: i, result });
+                        continue;
+                    }
+                    if complete {
+                        break;
+                    }
+                    let dir = session.as_ref().unwrap();
+                    let (records, finished) = difftool::read_session(dir);
+                    if records.len() > entries.len() {
+                        let new: Vec<FileEntry> =
+                            records[entries.len()..].iter().map(|r| r.entry()).collect();
+                        entries.extend(new.iter().cloned());
+                        done.resize(entries.len(), false);
+                        notify(Msg::MoreFiles(new));
+                    } else if finished {
+                        complete = true;
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
                 }
             })
             .expect("spawn loader thread");
@@ -234,6 +271,8 @@ fn parse_args() -> Result<Options, String> {
     let mut start_row = None;
     let mut git_args: Option<Vec<String>> = None;
     let mut show_args: Option<Vec<String>> = None;
+    let mut session: Option<PathBuf> = None;
+    let mut difftool_base: Option<String> = None;
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
@@ -260,6 +299,23 @@ fn parse_args() -> Result<Options, String> {
             "--show" => {
                 show_args = Some(args.by_ref().collect());
                 break;
+            }
+            "--session" => session = Some(PathBuf::from(value("--session")?)),
+            "--difftool" => {
+                let local = PathBuf::from(value("--difftool")?);
+                let remote = PathBuf::from(value("--difftool")?);
+                let base = args.next();
+                match difftool::invocation(&local, &remote, base.as_deref()) {
+                    Ok(difftool::Outcome::Done) => std::process::exit(0),
+                    Ok(difftool::Outcome::Single) => {}
+                    Err(e) => {
+                        eprintln!("diffvader: difftool: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                difftool_base = base;
+                paths.push(local);
+                paths.push(remote);
             }
             "-w" | "--ignore-all-space" => whitespace = WhitespaceMode::IgnoreAll,
             "-b" | "--ignore-space-change" => whitespace = WhitespaceMode::IgnoreChange,
@@ -298,7 +354,9 @@ fn parse_args() -> Result<Options, String> {
     if (git_args.is_some() || show_args.is_some()) && !paths.is_empty() {
         return Err("--git / --show cannot be combined with file arguments".into());
     }
-    let git_input = if let Some(mut rest) = show_args {
+    let git_input = if let Some(dir) = session {
+        Some(Input::Session(dir))
+    } else if let Some(mut rest) = show_args {
         // The first non-option argument is the commit; everything else goes to git diff.
         let commit = rest
             .iter()
@@ -321,6 +379,9 @@ fn parse_args() -> Result<Options, String> {
             }
             let right = paths.pop().unwrap();
             let left = paths.pop().unwrap();
+            if let Some(b) = &difftool_base {
+                std::env::set_var("BASE", b);
+            }
             let (lt, rt) = titles(&left, &right);
             (Input::Pair(left, right), lt, rt)
         }
@@ -375,7 +436,7 @@ fn exe_path() -> String {
 fn git_config_snippet() -> String {
     let exe = exe_path();
     format!(
-        "[alias]\n\tdv = !{exe} --git\n\tdvs = !{exe} --show\n[diff]\n\ttool = diffvader\n[difftool]\n\tprompt = false\n[difftool \"diffvader\"]\n\tcmd = {exe} \"$LOCAL\" \"$REMOTE\"\n\n# `git dv [<git diff args>]` is the fast path (no temp files, one window for all files);\n# `git dvs [<commit>]` shows one commit against its parent, like git show;\n# `git difftool` also works but pays git's per-file setup cost.\n"
+        "[alias]\n\tdv = !{exe} --git\n\tdvs = !{exe} --show\n[diff]\n\ttool = diffvader\n[difftool]\n\tprompt = false\n[difftool \"diffvader\"]\n\tcmd = {exe} --difftool \"$LOCAL\" \"$REMOTE\" \"$BASE\"\n\n# `git dv [<git diff args>]` is the fast path (no temp files, one window for all files);\n# `git dvs [<commit>]` shows one commit against its parent, like git show;\n# `git difftool` also works (one window for all files) but pays git's per-file setup cost.\n"
     )
 }
 
@@ -388,7 +449,7 @@ fn install_git() {
         ("difftool.prompt", "false".to_string()),
         (
             "difftool.diffvader.cmd",
-            format!("{exe} \"$LOCAL\" \"$REMOTE\""),
+            format!("{exe} --difftool \"$LOCAL\" \"$REMOTE\" \"$BASE\""),
         ),
     ];
     for (k, v) in settings {

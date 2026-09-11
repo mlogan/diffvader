@@ -31,6 +31,8 @@ pub enum Input {
     Git(Vec<String>),
     /// One commit against its (first) parent, like `git show`; extra `git diff` args follow.
     Show(String, Vec<String>),
+    /// A `git difftool` session directory (see `difftool.rs`), read incrementally.
+    Session(PathBuf),
 }
 
 pub struct Options {
@@ -61,6 +63,8 @@ pub struct Loaded {
 pub enum Msg {
     /// The file set, sent once before any `Loaded`.
     Files(Result<FileSet, String>),
+    /// Additional files discovered after `Files` (difftool sessions grow as git runs).
+    MoreFiles(Vec<FileEntry>),
     Loaded {
         file: usize,
         result: Result<Loaded, String>,
@@ -1062,6 +1066,15 @@ impl App {
                     self.update_title();
                 }
                 Msg::Files(Err(e)) => self.global = State::Failed(e),
+                Msg::MoreFiles(entries) => {
+                    self.files.extend(entries.into_iter().map(|entry| FileSlot {
+                        entry,
+                        state: State::Loading,
+                        view: View::default(),
+                        stats: None,
+                    }));
+                    self.update_title();
+                }
                 Msg::Loaded { file, result } => {
                     let Some(slot) = self.files.get_mut(file) else {
                         continue;
@@ -1290,6 +1303,9 @@ impl App {
 
     fn finish(&mut self) {
         trace::mark("exiting");
+        if let Input::Session(dir) = &self.opts.input {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         if let Some(p) = &self.opts.trace_path {
             match trace::write_chrome_trace(p) {
                 Ok(()) => eprintln!("diffvader: wrote trace to {p}"),
