@@ -77,6 +77,8 @@ impl DrawList {
 pub enum SurfaceProblem {
     /// Skip this frame and try again.
     Timeout,
+    /// The window is not visible yet (or is hidden); nothing was presented.
+    Occluded,
     /// The surface must be reconfigured (resize/lost) before the next frame.
     Reconfigure,
     Fatal,
@@ -452,11 +454,18 @@ impl Gpu {
             match self.surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-                wgpu::CurrentSurfaceTexture::Timeout => return Err(SurfaceProblem::Timeout),
-                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                    return Err(SurfaceProblem::Reconfigure)
+                wgpu::CurrentSurfaceTexture::Timeout => {
+                    trace::mark("surface-timeout");
+                    return Err(SurfaceProblem::Timeout);
                 }
-                wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    trace::mark("surface-outdated");
+                    return Err(SurfaceProblem::Reconfigure);
+                }
+                wgpu::CurrentSurfaceTexture::Occluded => {
+                    trace::mark("surface-occluded");
+                    return Err(SurfaceProblem::Occluded);
+                }
                 wgpu::CurrentSurfaceTexture::Validation => return Err(SurfaceProblem::Fatal),
             }
         };

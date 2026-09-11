@@ -35,6 +35,10 @@ pub struct Options {
     pub trace_path: Option<String>,
     pub screenshot: Option<PathBuf>,
     pub quit_after_first_frame: bool,
+    /// Render this many scripted scroll frames after the first diff frame, then exit.
+    pub bench_scroll: Option<u32>,
+    /// 1-based row to start on (vim's `+N`).
+    pub start_row: Option<u64>,
 }
 
 pub struct Loaded {
@@ -90,6 +94,10 @@ pub struct App {
     first_diff_frame_done: bool,
     /// Set by render when a debug flag asks to exit after the first frame.
     want_exit: bool,
+    bench_remaining: u32,
+    bench_start: Option<Instant>,
+    /// `DIFFVADER_EXIT_AFTER_MS`: exit cleanly (writing traces) at this instant.
+    deadline: Option<Instant>,
 }
 
 /// Per-frame pixel geometry (physical pixels).
@@ -113,6 +121,10 @@ struct Layout {
 }
 
 impl App {
+    pub fn set_deadline(&mut self, at: Instant) {
+        self.deadline = Some(at);
+    }
+
     pub fn new(
         opts: Options,
         rx: mpsc::Receiver<Msg>,
@@ -160,6 +172,9 @@ impl App {
             first_frame_done: false,
             first_diff_frame_done: false,
             want_exit: false,
+            bench_remaining: 0,
+            bench_start: None,
+            deadline: None,
         })
     }
 
@@ -576,9 +591,11 @@ impl App {
                     self.state = State::Ready(l);
                     self.intra_cache.clear();
                     self.cursor = 0;
-                    // Land on the first change, like vimdiff does.
+                    // Land on the first change, like vimdiff does (or on the requested row).
                     let lay = self.layout();
-                    if let Some(h) = self.hunks().first() {
+                    if let Some(r) = self.opts.start_row {
+                        self.jump_to_row(&lay, (r.max(1) - 1) as usize);
+                    } else if let Some(h) = self.hunks().first() {
                         let r = h.rows.start as usize;
                         self.jump_to_row(&lay, r);
                     }
@@ -676,6 +693,17 @@ impl App {
                     if self.opts.quit_after_first_frame {
                         self.want_exit = true;
                     }
+                    if let Some(n) = self.opts.bench_scroll {
+                        self.bench_remaining = n;
+                        self.bench_start = Some(Instant::now());
+                    }
+                }
+                if self.bench_remaining > 0 {
+                    self.bench_step();
+                    window.request_redraw();
+                } else if self.bench_start.is_some() {
+                    self.bench_report();
+                    self.want_exit = true;
                 }
             }
             Err(SurfaceProblem::Reconfigure) => {
@@ -684,9 +712,42 @@ impl App {
                 window.request_redraw();
             }
             Err(SurfaceProblem::Timeout) => window.request_redraw(),
+            // Re-requesting here would spin the run loop and keep the window from ever
+            // becoming visible; the Occluded(false) event triggers the next frame instead.
+            Err(SurfaceProblem::Occluded) => {}
             Err(SurfaceProblem::Fatal) => eprintln!("diffvader: surface validation error"),
         }
         trace::frame_done(frame_start.elapsed());
+    }
+
+    /// One step of `--bench-scroll`: advance the view as if the user were flinging through
+    /// the file, so successive redraws cover the whole diff.
+    fn bench_step(&mut self) {
+        let n = self.opts.bench_scroll.unwrap_or(1).max(1);
+        let rows = self.rows().len() as f64;
+        let step = (rows * self.line_h as f64 / n as f64).max(self.line_h as f64);
+        self.scroll_y = (self.scroll_y + step).min(self.max_scroll());
+        if self.scroll_y >= self.max_scroll() {
+            self.scroll_y = 0.0;
+        }
+        let lay = self.layout();
+        self.clamp_cursor_to_view(&lay);
+        self.bench_remaining -= 1;
+    }
+
+    fn bench_report(&mut self) {
+        let n = self.opts.bench_scroll.unwrap_or(0);
+        let wall = self
+            .bench_start
+            .take()
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        eprintln!(
+            "diffvader: bench-scroll {} frames in {:.1} ms wall ({:.2} ms/frame incl. vsync wait)",
+            n,
+            wall.as_secs_f64() * 1e3,
+            wall.as_secs_f64() * 1e3 / n.max(1) as f64
+        );
     }
 
     fn intra_for(&mut self, row_idx: u32) -> Option<IntraDiff> {
@@ -1452,7 +1513,11 @@ impl ApplicationHandler<()> for App {
         window.request_redraw();
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, _ev: ()) {
+    fn user_event(&mut self, el: &ActiveEventLoop, _ev: ()) {
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            el.exit();
+            return;
+        }
         self.drain_messages();
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -1477,6 +1542,18 @@ impl ApplicationHandler<()> for App {
                 self.rebuild_font();
                 if let Some(w) = &self.window {
                     w.request_redraw();
+                }
+            }
+            WindowEvent::Occluded(occluded) => {
+                trace::mark(if occluded {
+                    "occluded-true"
+                } else {
+                    "occluded-false"
+                });
+                if !occluded {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
@@ -1519,6 +1596,7 @@ impl ApplicationHandler<()> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                trace::mark("redraw-requested");
                 self.render();
                 if self.want_exit {
                     el.exit();

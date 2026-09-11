@@ -20,7 +20,7 @@ use crate::text::FileData;
 const USAGE: &str = "\
 diffvader — fast side-by-side diff viewer
 
-usage: diffvader [options] LEFT RIGHT
+usage: diffvader [options] LEFT RIGHT [+ROW]
 
 options:
   -w, --ignore-all-space       ignore all whitespace
@@ -34,6 +34,7 @@ options:
       --trace FILE             write Chrome trace event JSON (Perfetto / chrome://tracing)
       --screenshot FILE.bmp    render the first diff frame to a BMP file and exit
       --quit-after-first-frame exit as soon as the diff is on screen (for benchmarking)
+      --bench-scroll N         scroll through the diff in N frames, print stats, exit
       --git-config             print the git config needed to use diffvader as a difftool
       --install-git            write that config to ~/.gitconfig (git config --global)
   -h, --help                   show this help
@@ -113,13 +114,25 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let _ = proxy_tx.send(proxy.clone());
 
-    let mut app = match App::new(opts, rx, tx, proxy, font_thread, gpu_thread) {
+    let mut app = match App::new(opts, rx, tx, proxy.clone(), font_thread, gpu_thread) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("diffvader: {e}");
             std::process::exit(1);
         }
     };
+    if let Some(ms) = std::env::var("DIFFVADER_EXIT_AFTER_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        let at = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        app.set_deadline(at);
+        let proxy = proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            let _ = proxy.send_event(());
+        });
+    }
     trace::mark("run-app");
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("diffvader: event loop error: {e}");
@@ -146,6 +159,8 @@ fn parse_args() -> Result<Options, String> {
     let mut trace_path = std::env::var("DIFFVADER_TRACE").ok();
     let mut screenshot = None;
     let mut quit_after_first_frame = false;
+    let mut bench_scroll = None;
+    let mut start_row = None;
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
@@ -185,6 +200,16 @@ fn parse_args() -> Result<Options, String> {
             "--trace" => trace_path = Some(value("--trace")?),
             "--screenshot" => screenshot = Some(PathBuf::from(value("--screenshot")?)),
             "--quit-after-first-frame" => quit_after_first_frame = true,
+            "--bench-scroll" => {
+                bench_scroll = Some(
+                    value("--bench-scroll")?
+                        .parse::<u32>()
+                        .map_err(|_| "--bench-scroll must be an integer".to_string())?,
+                )
+            }
+            s if s.starts_with('+') && s[1..].parse::<u64>().is_ok() => {
+                start_row = s[1..].parse().ok();
+            }
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option {s}")),
             _ => paths.push(PathBuf::from(a)),
         }
@@ -209,6 +234,8 @@ fn parse_args() -> Result<Options, String> {
         trace_path,
         screenshot,
         quit_after_first_frame,
+        bench_scroll,
+        start_row,
     })
 }
 
