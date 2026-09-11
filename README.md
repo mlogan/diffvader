@@ -31,3 +31,9 @@ diffvader a.rs b.rs    # two files, or two directory trees
 
 Full options, keys, colors and performance notes: [docs/USAGE.md](docs/USAGE.md).
 Architecture and status: [IMPLEMENTATION.md](IMPLEMENTATION.md).
+
+## Feedback
+
+Pull requests are disabled on this repository. Please
+[file an issue](https://github.com/mlogan/diffvader/issues) for bugs, requests or
+questions instead.
