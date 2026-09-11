@@ -9,6 +9,7 @@ cargo build --release
 
 git dv HEAD~3                                 # every file changed since HEAD~3, one window
 git dv                                        # unstaged changes (any `git diff` arguments work)
+git dvs abc123                                # one commit against its parent, like git show
 diffvader --git HEAD~3                        # the same without the alias
 git difftool HEAD~3                           # one window per file; slower (see below)
 diffvader old.rs new.rs                       # two files
@@ -20,6 +21,7 @@ diffvader tree-a/ tree-b/                     # two directory trees (git difftoo
 ```
 diffvader [options] LEFT RIGHT [+ROW]         compare two files, or two directory trees
 diffvader [options] [--git GIT-DIFF-ARGS]     show what `git diff GIT-DIFF-ARGS` would
+diffvader [options] --show [COMMIT] [ARGS]    one commit against its parent (like git show)
 
   -w, --ignore-all-space       ignore all whitespace
   -b, --ignore-space-change    ignore changes in the amount of whitespace
@@ -37,7 +39,9 @@ diffvader [options] [--git GIT-DIFF-ARGS]     show what `git diff GIT-DIFF-ARGS`
       --install-git            write that config with `git config --global`
 ```
 
-`--git` (or no arguments at all inside a repository) asks git for the changed-file list
+`--show COMMIT` (`git dvs`) diffs a commit against its first parent, the way `git show`
+does; a root commit is compared with the empty tree, and extra arguments such as `-- path`
+pass through to git. `--git` (or no arguments at all inside a repository) asks git for the changed-file list
 (`git diff --raw`) and streams file contents from one `git cat-file --batch` process, so
 nothing is written to disk and the git work overlaps window creation. Two directories
 (what `git difftool --dir-diff` passes) work the same way. Files are loaded in the

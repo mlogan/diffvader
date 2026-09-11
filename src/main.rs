@@ -27,6 +27,7 @@ diffvader — fast side-by-side diff viewer
 
 usage: diffvader [options] LEFT RIGHT [+ROW]     compare two files, or two directory trees
        diffvader [options] [--git GIT-DIFF-ARGS]  show what `git diff GIT-DIFF-ARGS` would
+       diffvader [options] --show [COMMIT] [ARGS]  one commit against its parent (like git show)
 
 options:
   -w, --ignore-all-space       ignore all whitespace
@@ -105,13 +106,20 @@ fn main() {
                     Input::Pair(left, right) => {
                         files::discover(left.as_path(), right.as_path(), titles)
                     }
-                    Input::Git(args) => git::discover(args.as_slice()).map(|(entries, reader)| {
-                        blobs = Some(reader);
-                        FileSet {
-                            entries,
-                            multi: true,
-                        }
-                    }),
+                    Input::Git(_) | Input::Show(..) => {
+                        let args = match &input {
+                            Input::Git(a) => a.clone(),
+                            Input::Show(c, rest) => git::show_args(c, rest),
+                            Input::Pair(..) => unreachable!(),
+                        };
+                        git::discover(args.as_slice()).map(|(entries, reader)| {
+                            blobs = Some(reader);
+                            FileSet {
+                                entries,
+                                multi: true,
+                            }
+                        })
+                    }
                 };
                 let set = match discovered {
                     Ok(set) => set,
@@ -224,6 +232,7 @@ fn parse_args() -> Result<Options, String> {
     let mut bench_scroll = None;
     let mut start_row = None;
     let mut git_args: Option<Vec<String>> = None;
+    let mut show_args: Option<Vec<String>> = None;
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
@@ -245,6 +254,10 @@ fn parse_args() -> Result<Options, String> {
             }
             "--git" => {
                 git_args = Some(args.by_ref().collect());
+                break;
+            }
+            "--show" => {
+                show_args = Some(args.by_ref().collect());
                 break;
             }
             "-w" | "--ignore-all-space" => whitespace = WhitespaceMode::IgnoreAll,
@@ -281,17 +294,26 @@ fn parse_args() -> Result<Options, String> {
             _ => paths.push(PathBuf::from(a)),
         }
     }
-    let git_args = match git_args {
-        Some(g) if !paths.is_empty() => {
-            let _ = g;
-            return Err("--git cannot be combined with file arguments".into());
-        }
-        Some(g) => Some(g),
-        None if paths.is_empty() => Some(Vec::new()),
-        None => None,
+    if (git_args.is_some() || show_args.is_some()) && !paths.is_empty() {
+        return Err("--git / --show cannot be combined with file arguments".into());
+    }
+    let git_input = if let Some(mut rest) = show_args {
+        // The first non-option argument is the commit; everything else goes to git diff.
+        let commit = rest
+            .iter()
+            .position(|a| !a.starts_with('-'))
+            .map(|i| rest.remove(i))
+            .unwrap_or_else(|| "HEAD".to_string());
+        Some(Input::Show(commit, rest))
+    } else if let Some(g) = git_args {
+        Some(Input::Git(g))
+    } else if paths.is_empty() {
+        Some(Input::Git(Vec::new()))
+    } else {
+        None
     };
-    let (input, left_title, right_title) = match git_args {
-        Some(g) => (Input::Git(g), String::new(), String::new()),
+    let (input, left_title, right_title) = match git_input {
+        Some(input) => (input, String::new(), String::new()),
         None => {
             if paths.len() != 2 {
                 return Err("expected exactly two files or directories".into());
@@ -352,7 +374,7 @@ fn exe_path() -> String {
 fn git_config_snippet() -> String {
     let exe = exe_path();
     format!(
-        "[alias]\n\tdv = !{exe} --git\n[diff]\n\ttool = diffvader\n[difftool]\n\tprompt = false\n[difftool \"diffvader\"]\n\tcmd = {exe} \"$LOCAL\" \"$REMOTE\"\n\n# `git dv [<git diff args>]` is the fast path (no temp files, one window for all files);\n# `git difftool` also works but pays git's per-file setup cost.\n"
+        "[alias]\n\tdv = !{exe} --git\n\tdvs = !{exe} --show\n[diff]\n\ttool = diffvader\n[difftool]\n\tprompt = false\n[difftool \"diffvader\"]\n\tcmd = {exe} \"$LOCAL\" \"$REMOTE\"\n\n# `git dv [<git diff args>]` is the fast path (no temp files, one window for all files);\n# `git dvs [<commit>]` shows one commit against its parent, like git show;\n# `git difftool` also works but pays git's per-file setup cost.\n"
     )
 }
 
@@ -360,6 +382,7 @@ fn install_git() {
     let exe = exe_path();
     let settings = [
         ("alias.dv", format!("!{exe} --git")),
+        ("alias.dvs", format!("!{exe} --show")),
         ("diff.tool", "diffvader".to_string()),
         ("difftool.prompt", "false".to_string()),
         (
@@ -383,5 +406,5 @@ fn install_git() {
             }
         }
     }
-    println!("done. `git dv [<git diff args>]` is the fast path; `git difftool` also works.");
+    println!("done. `git dv [<git diff args>]` and `git dvs [<commit>]` are the fast paths; `git difftool` also works.");
 }

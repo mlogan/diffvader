@@ -29,6 +29,8 @@ pub enum Input {
     Pair(PathBuf, PathBuf),
     /// Arguments for `git diff`.
     Git(Vec<String>),
+    /// One commit against its (first) parent, like `git show`; extra `git diff` args follow.
+    Show(String, Vec<String>),
 }
 
 pub struct Options {

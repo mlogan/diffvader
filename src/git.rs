@@ -71,6 +71,26 @@ pub fn discover(args: &[String]) -> Result<(Vec<FileEntry>, BlobReader), String>
     Ok((entries, reader))
 }
 
+/// Builds `git diff` arguments showing `commit` against its first parent, as `git show`
+/// does. A root commit is compared with the empty tree.
+pub fn show_args(commit: &str, rest: &[String]) -> Vec<String> {
+    let _s = trace::span("git-parent");
+    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let parent = Command::new("git")
+        .args(["rev-parse", "--verify", "-q", &format!("{commit}^")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| EMPTY_TREE.to_string());
+    let mut args = vec![parent, commit.to_string()];
+    args.extend(rest.iter().cloned());
+    args
+}
+
 /// Parses `git diff --raw -z --no-abbrev` output: records of
 /// `:<mode1> <mode2> <sha1> <sha2> <status>\0<path>\0`, with a second path for R/C.
 fn parse_raw(raw: &[u8], root: &std::path::Path) -> Result<Vec<FileEntry>, String> {
