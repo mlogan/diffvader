@@ -154,27 +154,45 @@ Follow-ups the same day:
 Branch `mlogan-syntax-highlighting`. Hand-written lexers, no runtime dependencies.
 
 Design:
-- `src/lex/mod.rs`: `Class` (u8 per byte: Plain, Comment, String, Number, Keyword, Type,
-  Function, Attribute, Lifetime, Property, Constant, Punct, Operator, ...), `Lang` chosen by
-  file extension, `lex(lang, src, out)`.
-- `src/lex/rust.rs`: single linear pass over the file bytes writing one class byte per
-  input byte into a preallocated buffer (`out[start..end].fill(class)`; Plain is 0 so
-  untouched bytes need no write). No tokens, no allocations inside the loop, one-token
-  lookbehind for the contextual cases tree-sitter distinguishes (`fn name`, `.field`,
-  `.method(`, `path::func(`, `name!`).
-- Lexing runs on the loader thread next to the diff and is stored with the `FileData`, so
-  the renderer only indexes `classes[byte]` while drawing a line.
-- Oracle test (`src/lex/oracle.rs`, `#[cfg(test)]`): tree-sitter + tree-sitter-highlight
-  (dev-dependencies only) highlight the same bytes; captures are mapped onto `Class` and
-  the two per-byte arrays are compared, reporting `file:line:col ours/oracle «text»`.
-  The default corpus is this repo's `src/*.rs`; `DIFFVADER_LEX_CORPUS=dir` runs over any
-  tree and prints mismatch statistics (`cargo test lex_oracle -- --nocapture`).
+- `src/lex/mod.rs`: `Class` (one byte per input byte: Plain=0, Comment, String, Escape,
+  Number, Keyword, Type, Function, Attribute, Lifetime, Property, Constant, Punct), `Lang`
+  by file extension, `lex(lang, src) -> Vec<u8>` (calloc'd, so Plain bytes cost nothing).
+- `src/lex/rust.rs`: one linear pass writing `out[start..end].fill(class)`. No token
+  stream, no allocation after the output buffer. Context tree-sitter gets from the parse
+  is approximated with lexer state: the previous significant token (`fn`, `.`, `::`,
+  `{`/`,`, type context, ...), a 64-entry bracket-kind stack indexed modulo 64 (match
+  arms, struct/enum declarations, parameter lists, macro arguments, generics, turbofish,
+  tuple types), a pattern bit per depth, and a few flags (`let` pattern, closure params,
+  `use`, `type` alias, `const`/`static` item, attribute/`macro_rules!` token-tree extent).
+- Oracle test (`src/lex/oracle.rs`, `#[cfg(test)]`; tree-sitter, tree-sitter-highlight and
+  tree-sitter-rust are dev-dependencies only). Stock `highlights.scm` captures map onto
+  `Class`; policy differences are normalizations there (operators are Punct, labels are
+  lifetimes, shebangs are comments). Macro bodies are unparsed token trees to tree-sitter,
+  so the oracle re-parses each as expressions, items, `match` arms (split at each
+  top-level comma) or a pattern and highlights the first form that parses cleanly; bodies
+  that parse in no form (`json!`, `quote!`) are marked unverifiable and skipped.
+- Usage: `cargo test lex_oracle -- --nocapture` (this repo's `src/`, including the fixture
+  `src/lex/testdata/constructs.rs`; must be zero mismatches). `DIFFVADER_LEX_CORPUS=dir`
+  runs any tree and prints per-pair statistics; `DIFFVADER_LEX_SHOW=n` caps lines per file.
+  `DIFFVADER_LEX_BENCH=file cargo test --release lex_bench -- --ignored --nocapture`.
+
+Measurements (2026-09-14, MacBook Pro):
+- This repo: 0 mismatches. sui `crates/` (1725 files, 23.6 MB, 1.7% unverifiable macro
+  bodies): 96 mismatched bytes in 32 runs (0.0004%). What remains is out of lexer reach:
+  variables named `u8`/`str`, bounds like `+ FnOnce(..)` after `'static`, `t.0.0`.
+- Speed: 6.3 MB of concatenated sui sources in 9.7 ms, 1.56 ns/byte (~640 MB/s). A 50 KB
+  file lexes in under 0.1 ms.
+- Profiling note: `xctrace` needs full Xcode (not installed); tuning was done by A/B on
+  `lex_bench`. Wins: skipping whitespace runs in one call, masking bracket-stack indexes
+  instead of `min` clamps, and skipping the lookahead for keywords (1.90 -> 1.56 ns/byte).
 
 Progress:
-- [ ] lex module + Rust lexer
-- [ ] oracle harness
-- [ ] renderer + theme colors
-- [ ] TODO lexers: C/C++, Go, Python, JavaScript/TypeScript, Java, Swift, Move, Shell, Markdown/TOML/YAML
+- [x] lex module + Rust lexer
+- [x] oracle harness, fixture, direct test, benchmark
+- [ ] renderer + theme colors: lex on the loader thread next to the diff, store classes
+      with `FileData`, look up color by class in `draw_line`
+- [ ] lexers listed as TODOs in `src/lex/mod.rs`: C, C++, Go, Python, JavaScript,
+      TypeScript, Java, C#, Swift, Shell (+ Move)
 
 ## Remaining / ideas
 
