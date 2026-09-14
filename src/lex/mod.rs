@@ -8,6 +8,7 @@
 use std::path::Path;
 
 mod rust;
+mod typescript;
 
 #[cfg(test)]
 mod oracle;
@@ -88,6 +89,7 @@ impl Class {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     Rust,
+    TypeScript,
     // TODO: one lexer per language below, each with its tree-sitter grammar added as a
     // dev-dependency and wired into `oracle::Oracle::new`, and zero oracle mismatches on a
     // fixture in `testdata/`:
@@ -96,9 +98,10 @@ pub enum Lang {
     // - Go (`.go`): tree-sitter-go. Backtick raw strings, no nesting comments.
     // - Python (`.py`): tree-sitter-python. Triple-quoted and prefixed (f/r/b) strings,
     //   decorators as attributes.
-    // - JavaScript (`.js`, `.mjs`, `.jsx`): tree-sitter-javascript. Template literals with
-    //   `${..}` nesting and the regex-literal-vs-division ambiguity.
-    // - TypeScript (`.ts`, `.tsx`): tree-sitter-typescript. JavaScript plus type positions.
+    // - JavaScript (`.js`, `.mjs`, `.cjs`): tree-sitter-javascript. The TypeScript lexer
+    //   minus type positions; its oracle query is JavaScript's alone.
+    // - TSX and JSX (`.tsx`, `.jsx`): tree-sitter-typescript's TSX grammar. JSX elements
+    //   and text on top of the TypeScript lexer.
     // - Java (`.java`): tree-sitter-java. Text blocks, annotations as attributes.
     // - C# (`.cs`): tree-sitter-c-sharp. Verbatim and interpolated strings.
     // - Swift (`.swift`): tree-sitter-swift. Nested comments, `#""#` raw strings.
@@ -111,6 +114,7 @@ impl Lang {
         let ext = Path::new(path).extension()?.to_str()?;
         match ext {
             "rs" => Some(Lang::Rust),
+            "ts" | "mts" | "cts" => Some(Lang::TypeScript),
             _ => None,
         }
     }
@@ -131,6 +135,7 @@ fn lex_bench() {
         let t = std::time::Instant::now();
         match lang {
             Lang::Rust => rust::lex(&src, &mut out),
+            Lang::TypeScript => typescript::lex(&src, &mut out),
         }
         best = best.min(t.elapsed().as_secs_f64());
     }
@@ -150,6 +155,7 @@ pub fn lex(lang: Lang, src: &[u8]) -> Vec<u8> {
     let mut out = vec![Class::Plain as u8; src.len()];
     match lang {
         Lang::Rust => rust::lex(src, &mut out),
+        Lang::TypeScript => typescript::lex(src, &mut out),
     }
     out
 }

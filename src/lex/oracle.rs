@@ -10,9 +10,14 @@
 //!   `<`/`>` only in generics).
 //! - Loop labels are colored like lifetimes (tree-sitter-rust captures only lifetimes).
 //! - Shebang lines are comments.
+//! - TypeScript: `this` and `super` are keywords, but the other `variable.builtin` names
+//!   (`console`, `window`, `module`, ...) are ordinary identifiers.
+//! - Bytes inside tree-sitter `ERROR` nodes have no truth and are skipped, like
+//!   unparseable macro bodies.
 //! - Macro arguments are unparsed token trees to tree-sitter; the oracle re-highlights
 //!   each invocation's token tree as an expression list so the lexer is checked there too.
-//! - Newline bytes are never compared (they are never drawn).
+//! - Newline and carriage return bytes are never compared (the renderer draws neither
+//!   with a class color).
 //!
 //! `cargo test lex_oracle -- --nocapture` reports mismatches on this repo's sources.
 //! `DIFFVADER_LEX_CORPUS=dir` runs over every supported file under `dir` instead and
@@ -31,6 +36,9 @@ const PLAIN: u8 = Class::Plain as u8;
 const ATTRIBUTE: u8 = Class::Attribute as u8;
 const LIFETIME: u8 = Class::Lifetime as u8;
 const PUNCT: u8 = Class::Punct as u8;
+/// Oracle-only marker for `variable.builtin` in languages where only some of those names
+/// are keywords; resolved by text in `classify`.
+const BUILTIN: u8 = 254;
 /// Oracle-only marker for bytes with no truth available (macro bodies that parse in no
 /// form, such as `json!` or `quote!` with interpolations); `compare` skips them.
 pub const UNKNOWN: u8 = 255;
@@ -43,6 +51,7 @@ fn class_for_capture(name: &str) -> Class {
         "string" => Class::String,
         "escape" => Class::Escape,
         "keyword" => Class::Keyword,
+        "number" => Class::Number,
         "type" | "constructor" => Class::Type,
         "function" => Class::Function,
         "attribute" => Class::Attribute,
@@ -64,8 +73,12 @@ fn class_for_capture(name: &str) -> Class {
 }
 
 /// Characters that tree-sitter's queries leave uncaptured or capture inconsistently
-/// but that the lexers always mark as `Punct`.
-fn is_operator_char(b: u8) -> bool {
+/// but that the lexers always mark as `Punct`. `$` is an identifier character in
+/// TypeScript.
+fn is_operator_char(lang: Lang, b: u8) -> bool {
+    if b == b'$' && lang == Lang::TypeScript {
+        return false;
+    }
     matches!(
         b,
         b'+' | b'-'
@@ -100,14 +113,25 @@ pub struct Oracle {
 
 impl Oracle {
     pub fn new(lang: Lang) -> Oracle {
-        let (language, name, highlights): (Language, &str, &str) = match lang {
+        let (language, name, highlights): (Language, &str, String) = match lang {
             Lang::Rust => (
                 tree_sitter_rust::LANGUAGE.into(),
                 "rust",
-                tree_sitter_rust::HIGHLIGHTS_QUERY,
+                tree_sitter_rust::HIGHLIGHTS_QUERY.to_string(),
+            ),
+            // Composed as upstream's tree-sitter.json does: TypeScript's query, then
+            // JavaScript's. For the same node the later pattern wins.
+            Lang::TypeScript => (
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                "typescript",
+                format!(
+                    "{}\n{}",
+                    tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                    tree_sitter_javascript::HIGHLIGHT_QUERY
+                ),
             ),
         };
-        let mut config = HighlightConfiguration::new(language.clone(), name, highlights, "", "")
+        let mut config = HighlightConfiguration::new(language.clone(), name, &highlights, "", "")
             .expect("highlight query");
         let names: Vec<String> = config
             .query
@@ -116,7 +140,13 @@ impl Oracle {
             .map(|s| s.to_string())
             .collect();
         config.configure(&names);
-        let classes = names.iter().map(|n| class_for_capture(n) as u8).collect();
+        let classes = names
+            .iter()
+            .map(|n| match (lang, n.as_str()) {
+                (Lang::TypeScript, "variable.builtin") => BUILTIN,
+                _ => class_for_capture(n) as u8,
+            })
+            .collect();
         Oracle {
             lang,
             language,
@@ -129,18 +159,32 @@ impl Oracle {
     pub fn classify(&self, src: &[u8]) -> Vec<u8> {
         let mut out = vec![PLAIN; src.len()];
         self.highlight_into(src, &mut out);
+        self.mark_errors(src, &mut out);
+        let mut i = 0;
+        while i < out.len() {
+            if out[i] != BUILTIN {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < out.len() && out[i] == BUILTIN {
+                i += 1;
+            }
+            let keyword = matches!(&src[start..i], b"this" | b"super");
+            out[start..i].fill(if keyword { Class::Keyword as u8 } else { PLAIN });
+        }
         // A shebang line is uncaptured; it is colored as a comment.
         if src.starts_with(b"#!") && src.get(2) != Some(&b'[') {
             let end = memchr::memchr(b'\n', src).unwrap_or(src.len());
             out[..end].fill(Class::Comment as u8);
         }
         for i in 0..src.len() {
-            if (out[i] == PLAIN || out[i] == ATTRIBUTE) && is_operator_char(src[i]) {
+            if (out[i] == PLAIN || out[i] == ATTRIBUTE) && is_operator_char(self.lang, src[i]) {
                 out[i] = PUNCT;
             }
             // A lifetime's `'` is captured as an operator, and labels not at all; both
             // are colored as one lifetime token.
-            if src[i] == b'\'' && out[i] == PUNCT && i + 1 < src.len() {
+            if self.lang == Lang::Rust && src[i] == b'\'' && out[i] == PUNCT && i + 1 < src.len() {
                 let mut j = i + 1;
                 while j < src.len()
                     && (src[j] == b'_' || src[j].is_ascii_alphanumeric())
@@ -154,6 +198,30 @@ impl Oracle {
             }
         }
         out
+    }
+
+    /// Marks bytes inside `ERROR` nodes as `UNKNOWN`.
+    fn mark_errors(&self, src: &[u8], out: &mut [u8]) {
+        let mut parser = Parser::new();
+        parser.set_language(&self.language).unwrap();
+        let Some(tree) = parser.parse(src, None) else {
+            return;
+        };
+        if !tree.root_node().has_error() {
+            return;
+        }
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.is_error() {
+                out[node.start_byte()..node.end_byte()].fill(UNKNOWN);
+                continue;
+            }
+            if !node.has_error() {
+                continue;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
     }
 
     fn highlight_into(&self, src: &[u8], out: &mut [u8]) {
@@ -418,7 +486,7 @@ pub fn compare(src: &[u8], ours: &[u8], oracle: &[u8]) -> Vec<Mismatch> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < ours.len() {
-        if ours[i] == oracle[i] || src[i] == b'\n' || oracle[i] == UNKNOWN {
+        if ours[i] == oracle[i] || matches!(src[i], b'\n' | b'\r') || oracle[i] == UNKNOWN {
             i += 1;
             continue;
         }
