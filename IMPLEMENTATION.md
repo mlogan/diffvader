@@ -197,6 +197,51 @@ Progress:
 - [ ] lexers listed as TODOs in `src/lex/mod.rs`: C, C++, Go, Python, JavaScript,
       TypeScript, Java, C#, Swift, Shell (+ Move)
 
+## TypeScript highlighting (2026-09-14)
+
+Branch `mlogan-typescript-highlighting`. `src/lex/typescript.rs`, same contract as the Rust
+lexer: one pass, one class byte per input byte, no allocation after the output buffer.
+
+Design:
+- State: previous significant token (`Prev`: statement start, operator, value, `)`, `.`,
+  binding/declaration names, member modifiers, type position, type end, qualifier, ...),
+  a 64-entry bracket-kind stack (paren, bracket, block, object literal or pattern, class
+  body, interface body, object type, enum body, template substitution in a string or a
+  type, generic arguments in a type / of a call / type parameters / function type
+  parameters, type paren, type bracket, index signature), per-depth ternary counts with a
+  bit per open `?` that belongs to a conditional type, per-depth `extends` counts (a
+  conditional type's `?` needs one), per-depth pending body kind after `class` /
+  `interface` / `enum`, and flags for `let`/`const` bindings, type aliases, headers,
+  `case`, `?:`, `new`, import/export clauses and `await`.
+- Regex vs division from `prev`; template literals resume after a substitution's `}`.
+- Bounded lookaheads, each only at the token that needs it: generic call `f<T>(` (scan to
+  the matching `>`), function-valued bindings and keys (`= (..) =>`, `: function`),
+  whether a function or class member has a body (signatures and overloads are not
+  captured as functions), destructuring parameter vs grouped object type after `({`.
+- Oracle: tree-sitter-typescript's query followed by tree-sitter-javascript's, as
+  upstream's tree-sitter.json composes them (later patterns win). Policy additions:
+  `variable.builtin` is a keyword only for `this`/`super`; bytes in `ERROR` nodes and `\r`
+  bytes are not compared (the TypeScript sources use CRLF).
+- Tree-sitter quirks encoded because they are exact and cheap: `await f<T>(x)` and
+  `!f<T>(x)` are not calls; regex delimiters are punctuation; operator characters in
+  template literal type text are punctuation; `unique symbol` is one type token.
+
+Measurements (2026-09-14, MacBook Pro):
+- TypeScript 5.9.3 `src/` (701 files, 20.6 MB, sparse clone of microsoft/TypeScript at
+  tag v5.9.3; `main` is now the Go port): 902 mismatched bytes in 67 runs (0.0044%).
+  Nearly all are a grammar quirk in qualified names after `as`/`satisfies`
+  (`x as a.b.C` nests differently from `x: a.b.C`, and the pattern changes with segment
+  count and what follows); encoding it made things worse, so it is left.
+- Local `.ts` from sui, pas and sui-operations (218 files, 937 KB): 1 mismatched run.
+- Speed: 9.4 MB of concatenated compiler sources in 16.6 ms, 1.77 ns/byte (564 MB/s).
+- Rust results unchanged (sui crates: 0.0004%).
+
+Progress:
+- [x] oracle support (composed queries, builtins, ERROR regions, CRLF)
+- [x] lexer, unit test, fixture `src/lex/testdata/constructs.ts`
+- [x] renderer: nothing to change beyond `Lang::from_path` (`.ts`, `.mts`, `.cts`)
+- [ ] TSX/JSX and plain JavaScript (TODOs in `src/lex/mod.rs`)
+
 ## Remaining / ideas
 
 - Borderless window with custom title bar (~22 ms faster cold start; not needed for the 200 ms target)
