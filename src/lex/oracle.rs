@@ -210,27 +210,30 @@ impl Oracle {
             let expr = Snippet::new(b"fn _(){(", vec![(0, inner.len())], b")}");
             let items = Snippet::new(b"", vec![(0, inner.len())], b"");
             let mut candidates = vec![expr, items];
-            if let Some(c) = top_level_comma(inner) {
-                // A trailing comma is not part of the pattern.
-                let mut pat_end = inner.len();
-                while pat_end > c + 1 && matches!(inner[pat_end - 1], b' ' | b'\n' | b'\t' | b'\r')
-                {
-                    pat_end -= 1;
-                }
-                if pat_end > c + 1 && inner[pat_end - 1] == b',' {
-                    pat_end -= 1;
-                }
-                let as_match = Snippet::new(
-                    b"fn _(){match (",
-                    vec![(0, c), (c + 1, pat_end)],
-                    b" => ()}}",
-                )
-                .with_glue(b") {");
-                if &src[inv.name.0..inv.name.1] == b"matches" {
-                    candidates.insert(0, as_match);
-                } else {
-                    candidates.push(as_match);
-                }
+            // `matches!(scrutinee, pattern)`: split at each top-level comma in turn. A
+            // trailing comma is not part of the pattern.
+            let mut pat_end = inner.len();
+            while pat_end > 0 && matches!(inner[pat_end - 1], b' ' | b'\n' | b'\t' | b'\r') {
+                pat_end -= 1;
+            }
+            if pat_end > 0 && inner[pat_end - 1] == b',' {
+                pat_end -= 1;
+            }
+            let as_match: Vec<Snippet> = top_level_commas(&inner[..pat_end])
+                .into_iter()
+                .map(|c| {
+                    Snippet::new(
+                        b"fn _(){match (",
+                        vec![(0, c), (c + 1, pat_end)],
+                        b" => ()}}",
+                    )
+                    .with_glue(b") {")
+                })
+                .collect();
+            if src[inv.name.0..inv.name.1].ends_with(b"matches") {
+                candidates.splice(0..0, as_match);
+            } else {
+                candidates.extend(as_match);
             }
             if inv.in_pattern {
                 let as_pattern = Snippet::new(b"fn _(){let (", vec![(0, inner.len())], b") = 0;}");
@@ -315,15 +318,17 @@ impl Snippet {
     }
 }
 
-/// Offset of the first `,` outside brackets and strings.
-fn top_level_comma(src: &[u8]) -> Option<usize> {
+/// Offsets of the `,`s outside brackets and strings (generics are not brackets here, so
+/// callers try each).
+fn top_level_commas(src: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
     let mut depth = 0i32;
     let mut i = 0;
     while i < src.len() {
         match src[i] {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
-            b',' if depth == 0 => return Some(i),
+            b',' if depth == 0 => out.push(i),
             b'"' => {
                 i += 1;
                 while i < src.len() && src[i] != b'"' {
@@ -337,7 +342,7 @@ fn top_level_comma(src: &[u8]) -> Option<usize> {
         }
         i += 1;
     }
-    None
+    out
 }
 
 struct Invocation {

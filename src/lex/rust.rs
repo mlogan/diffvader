@@ -73,6 +73,8 @@ const GENERIC_CTX: u8 = b'C';
 const TURBOFISH: u8 = b'f';
 /// `(` in a type: a tuple type, `,` inside stays in the type context.
 const TYPE_PAREN: u8 = b't';
+/// `name!(`, `name![`, `name! {`: arguments, which are expressions, not types.
+const MACRO_ARGS: u8 = b'!';
 
 const fn make_table(start: bool) -> [bool; 256] {
     let mut t = [false; 256];
@@ -348,6 +350,10 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
     let mut fn_pending = false;
     // Between the `|`s of a closure's parameter list, where `a: T` is not a field.
     let mut in_closure = false;
+    // After `type Name` until `=`: the right-hand side is a type.
+    let mut type_alias = false;
+    // After `const`/`static` in item position: the next `:` starts a type.
+    let mut item_colon = false;
     // Attributes and `macro_rules!` bodies are token trees: lexed as ordinary tokens (over
     // an Attribute background for attributes) but without the contextual rules. The token
     // before an attribute is restored as `prev` at its end so `#[attr] field: T` works.
@@ -378,7 +384,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
             while d > 0
                 && matches!(
                     brackets[(d - 1).min(brackets.len() - 1)],
-                    OTHER | BRACE | GENERIC | GENERIC_CTX | TURBOFISH
+                    OTHER | BRACE | GENERIC | GENERIC_CTX | TURBOFISH | MACRO_ARGS
                 )
             {
                 d -= 1;
@@ -566,10 +572,15 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                             // `use path;` or `use<'a>` precise capturing.
                             b"use" if nb != b'<' => in_use = true,
                             b"as" if !in_use => new_prev = Prev::TypeCtx,
-                            b"impl" | b"trait" | b"type" => new_prev = Prev::TypeCtx,
+                            b"impl" | b"trait" => new_prev = Prev::TypeCtx,
+                            b"type" => {
+                                new_prev = Prev::TypeCtx;
+                                type_alias = !in_tt;
+                            }
                             b"mut" | b"const" | b"dyn" | b"for" if prev == Prev::TypeCtx => {
                                 new_prev = Prev::TypeCtx
                             }
+                            b"const" | b"static" if !in_tt => item_colon = true,
                             b"self" => new_prev = Prev::Value,
                             // `macro_rules!` is one keyword.
                             b"macro_rules" if next == b'!' => {
@@ -589,8 +600,13 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     }
                     TYPE if nb == b'(' => class = if in_pattern!() { PLAIN } else { FUNCTION },
                     TYPE if prev == Prev::Dot => class = PROPERTY,
-                    // `use std::str`, `let str = ..`
-                    TYPE if path_next || in_use || (let_pattern && prev != Prev::TypeCtx) => {
+                    // `use std::str`, `let str = ..`, and a bare primitive name as a macro
+                    // argument (`impl_from!(u8, u16)`), which is an expression.
+                    TYPE if path_next
+                        || in_use
+                        || (let_pattern && prev != Prev::TypeCtx)
+                        || (prev != Prev::TypeCtx && innermost!() == MACRO_ARGS) =>
+                    {
                         class = PLAIN
                     }
                     TYPE => new_prev = Prev::Type,
@@ -613,9 +629,11 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                             out[i..=end].fill(FUNCTION);
                             i = end + 1;
                             prev = Prev::Other;
-                            if id == b"matches" {
-                                pending[depth.min(63)] = MATCH_PAREN;
-                            }
+                            pending[depth.min(63)] = if id.ends_with(b"matches") {
+                                MATCH_PAREN
+                            } else {
+                                MACRO_ARGS
+                            };
                             continue;
                         } else if prev == Prev::Dot {
                             if nb == b'(' || turbofish {
@@ -679,7 +697,17 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     tt_end = tt_end.max(bracket_end(src, i));
                 }
                 let waiting = pending[depth.min(63)];
+                item_colon = false;
                 let kind = match b {
+                    _ if waiting == MACRO_ARGS => {
+                        pending[depth.min(63)] = 0;
+                        MACRO_ARGS
+                    }
+                    // `struct S(u8);`
+                    b'(' if waiting == DECL_BRACE => {
+                        pending[depth.min(63)] = 0;
+                        TYPE_PAREN
+                    }
                     b'{' | b'(' if waiting != 0 && (b == b'{') == (waiting != MATCH_PAREN) => {
                         pending[depth.min(63)] = 0;
                         waiting
@@ -690,6 +718,8 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     b'(' if fn_pending => PARAMS,
                     b'(' if prev == Prev::Pub => VIS,
                     b'(' if prev == Prev::TypeCtx => TYPE_PAREN,
+                    // `enum E { V(u8) }`
+                    b'(' if prev == Prev::Type && innermost!() == ENUM_BRACE => TYPE_PAREN,
                     _ => OTHER,
                 };
                 fn_pending = false;
@@ -706,8 +736,8 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     _ if b == b'{' => Prev::FieldStart,
                     _ => Prev::Other,
                 };
-                in_closure = false;
-                in_use &= b != b'{';
+                // A closure's parameters can hold `(..)` patterns but never a block.
+                in_closure &= b != b'{';
                 i += 1;
             }
             b')' | b']' | b'}' => {
@@ -766,6 +796,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                 // `T: Bound`, `let x: T`, `|a: T|`, fields and parameters.
                 prev = if (let_pattern && depth == let_depth)
                     || in_closure
+                    || std::mem::take(&mut item_colon)
                     || prev == Prev::Type
                     || matches!(innermost!(), DECL_BRACE | PARAMS)
                 {
@@ -811,11 +842,20 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     if depth > 0 {
                         pattern_bits &= !(1 << (depth - 1).min(63));
                     }
+                    prev = Prev::Other;
                 } else {
                     i += 1;
+                    // `type A = T;` and `<T = Default>`
+                    prev = if std::mem::take(&mut type_alias)
+                        || matches!(innermost!(), GENERIC | GENERIC_CTX)
+                    {
+                        Prev::TypeCtx
+                    } else {
+                        Prev::Other
+                    };
                 }
                 let_pattern = false;
-                prev = Prev::Other;
+                item_colon = false;
             }
             b'-' if at(src, i + 1) == b'>' => {
                 out[i] = PUNCT;
@@ -825,7 +865,9 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
             }
             b'&' | b'*' | b'<' => {
                 out[i] = PUNCT;
-                let in_type = prev == Prev::TypeCtx || (b == b'<' && prev == Prev::Type);
+                // `x as usize <= n` compares; `<<` and `<=` never open generics.
+                let in_type = (prev == Prev::TypeCtx || (b == b'<' && prev == Prev::Type))
+                    && !(b == b'<' && matches!(at(src, i + 1), b'=' | b'<'));
                 if b == b'<' && in_type {
                     if depth < brackets.len() {
                         brackets[depth] = if prev == Prev::Type {
@@ -864,6 +906,8 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                 in_closure = false;
                 let_pattern = false;
                 in_use = false;
+                type_alias = false;
+                item_colon = false;
                 // `struct Unit;` never gets its brace.
                 pending[depth.min(63)] = 0;
                 i += 1;
