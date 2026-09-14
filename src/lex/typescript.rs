@@ -23,8 +23,10 @@ const PUNCT: u8 = Class::Punct as u8;
 /// The previous significant token, as far as classification cares.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Prev {
-    /// Statement start: `;`, a block's braces, `=>`, `else`. `{` here opens a block.
+    /// Statement start: `;`, a block's braces, `else`. `{` here opens a block.
     Stmt,
+    /// `=>` of an arrow function: like `Stmt`, but never a member position.
+    Arrow,
     /// An operator or keyword that expects an expression. `{` opens an object, `/` a regex.
     Op,
     /// The end of a value: identifier, literal, `]`, an object's `}`. `/` divides.
@@ -49,8 +51,10 @@ enum Prev {
     TypeCtx,
     /// A type just ended: `<`, `[`, `|`, `&`, `.` continue it.
     Type,
-    /// `ns.` inside a type.
+    /// `ns.` inside a type: the next name is a type, or a middle segment.
     TypeQual,
+    /// A qualifier name inside a type, before its `.`.
+    TypeQualName,
     /// `)` of a function type's parameters: `=>` continues the type.
     TypeParenClose,
     /// `typeof` inside a type: an expression name follows.
@@ -168,6 +172,13 @@ fn block_comment_end(src: &[u8], i: usize) -> usize {
     src.len()
 }
 
+impl Prev {
+    /// A type just ended, including a parenthesized one.
+    fn type_end(self) -> bool {
+        matches!(self, Prev::Type | Prev::TypeParenClose)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Word {
     /// Not a keyword.
@@ -203,6 +214,15 @@ fn word(id: &[u8]) -> Word {
         b"any" | b"number" | b"boolean" | b"string" | b"symbol" | b"unknown" | b"never"
         | b"object" | b"bigint" => Word::Predefined,
         _ => Word::Ident,
+    }
+}
+
+/// `^[A-Z_][A-Z\d_]+$` names are constants, everything else `PLAIN`: the rule for
+/// shorthand property names, which are not identifiers to the constructor pattern.
+fn constant_only(id: &[u8]) -> u8 {
+    match by_convention(id, PLAIN) {
+        CONSTANT => CONSTANT,
+        _ => PLAIN,
     }
 }
 
@@ -274,6 +294,10 @@ fn generic_end(src: &[u8], i: usize) -> Option<usize> {
                 }
             }
             b'=' if at(src, j + 1) == b'>' => j += 1,
+            b'/' if at(src, j + 1) == b'/' => {
+                j = memchr::memchr(b'\n', &src[j..]).map_or(end, |k| j + k);
+            }
+            b'/' if at(src, j + 1) == b'*' => j = block_comment_end(src, j) - 1,
             b'(' | b'[' | b'{' => j = bracket_end(src, j, end - j)? - 1,
             b'=' if at(src, j + 1) == b'=' => return None,
             b';' | b')' | b']' | b'}' | b'+' | b'*' | b'/' | b'%' | b'^' | b'!' => return None,
@@ -383,6 +407,28 @@ fn binds_function(src: &[u8], i: usize) -> bool {
     at(src, k) == b'=' && !matches!(at(src, k + 1), b'=' | b'>') && is_function_value(src, k + 1)
 }
 
+/// Whether `is` starts at `i` as a word (a type predicate follows).
+fn is_pred_follows(src: &[u8], i: usize) -> bool {
+    src[i..].starts_with(b"is") && !is_ident_cont(at(src, i + 2))
+}
+
+/// For a `{` at `i` that starts a function type's parameter: whether it is a destructuring
+/// pattern (`({ a }: T) => R`) rather than a grouped object type (`({ a: T } | U)`).
+fn pattern_param(src: &[u8], i: usize) -> bool {
+    let Some(e) = bracket_end(src, i, 8192) else {
+        return false;
+    };
+    let k = skip_trivia(src, e);
+    match at(src, k) {
+        b':' | b'=' | b',' => true,
+        b')' => {
+            let m = skip_trivia(src, k + 1);
+            at(src, m) == b'=' && at(src, m + 1) == b'>'
+        }
+        _ => false,
+    }
+}
+
 /// For `import`/`export` followed by `i`: whether a clause of names follows, as opposed
 /// to a declaration (`export const ..`, `export type X = ..`).
 fn import_clause(src: &[u8], i: usize, export: bool) -> bool {
@@ -393,7 +439,8 @@ fn import_clause(src: &[u8], i: usize, export: bool) -> bool {
     let e = ident_end(src, i);
     match &src[i..e] {
         b"const" | b"let" | b"var" | b"function" | b"class" | b"interface" | b"enum"
-        | b"default" | b"async" | b"declare" | b"abstract" | b"namespace" | b"module" => false,
+        | b"default" | b"async" | b"declare" | b"abstract" | b"namespace" | b"module"
+        | b"import" => false,
         b"type" if export => {
             let name = skip_trivia(src, e);
             if !is_ident_start(at(src, name)) {
@@ -428,7 +475,7 @@ fn has_body(src: &[u8], i: usize) -> bool {
     }
     // Return type: a `{` right after a type operator opens an object type; any other `{`
     // is the body. A name that does not continue the type starts the next declaration.
-    let end = (j + 2048).min(src.len());
+    let end = (j + 8192).min(src.len());
     let mut last = b':';
     j += 1;
     while j < end {
@@ -523,11 +570,22 @@ fn string(src: &[u8], out: &mut [u8], i: usize, q: u8) -> usize {
 /// `}`). Returns the index after the closing backtick, or after `${` with `true`. Template
 /// literal types (`in_type`) are not strings: nothing is written for them.
 fn template(src: &[u8], out: &mut [u8], i: usize, in_type: bool) -> (usize, bool) {
-    let (text, delim) = if in_type {
-        (PLAIN, PLAIN)
-    } else {
-        (STRING, PUNCT)
-    };
+    if in_type {
+        let r = template(src, out, i, false);
+        for k in i..r.0 {
+            out[k] = if is_type_template_punct(src[k]) {
+                PUNCT
+            } else {
+                PLAIN
+            };
+        }
+        if r.1 {
+            out[r.0 - 2] = PLAIN;
+            out[r.0 - 1] = PLAIN;
+        }
+        return r;
+    }
+    let (text, delim) = (STRING, PUNCT);
     let mut j = i;
     loop {
         let Some(k) = memchr::memchr3(b'`', b'\\', b'$', &src[j..]) else {
@@ -554,6 +612,31 @@ fn template(src: &[u8], out: &mut [u8], i: usize, in_type: bool) -> (usize, bool
             return (src.len(), false);
         }
     }
+}
+
+/// Operator characters in template literal type text, which tree-sitter leaves uncaptured.
+fn is_type_template_punct(b: u8) -> bool {
+    matches!(
+        b,
+        b'+' | b'-'
+            | b'*'
+            | b'/'
+            | b'%'
+            | b'^'
+            | b'!'
+            | b'&'
+            | b'|'
+            | b'='
+            | b'<'
+            | b'>'
+            | b'?'
+            | b'@'
+            | b'~'
+            | b'.'
+            | b':'
+            | b';'
+            | b','
+    )
 }
 
 /// A regex literal at the `/` at `i`, or `None` if the line ends first.
@@ -626,6 +709,8 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
     // Per depth: open `?` count, and a bit per open `?` that belongs to a conditional type.
     let mut tern = [0u8; 64];
     let mut tern_type = [0u32; 64];
+    // Per depth: `extends` seen in a type and not yet matched by a conditional type's `?`.
+    let mut ext = [0u8; 64];
     // Per depth: the kind the next `{` at that depth gets after `class`/`interface`/`enum`.
     let mut pending = [0u8; 64];
     // Depth of the innermost `let`/`const`/`var`, and whether its binding (before `=`)
@@ -646,8 +731,8 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
     let mut in_new = false;
     // In an `import`/`export` clause: `as` renames and names are never keywords.
     let mut in_import = false;
-    // After `await` until its operand's arguments: tree-sitter reads `await f<T>(x)` as
-    // comparisons, so the callee is not a call.
+    // After `await` or prefix `!` until the operand's arguments: tree-sitter reads
+    // `await f<T>(x)` as comparisons, so the callee is not a call.
     let mut after_await = false;
 
     macro_rules! innermost {
@@ -665,6 +750,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
             depth += 1;
             tern[depth & 63] = 0;
             tern_type[depth & 63] = 0;
+            ext[depth & 63] = 0;
             pending[depth & 63] = 0;
         }};
     }
@@ -758,7 +844,13 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     OBJECT => matches!(prev, Prev::FieldStart | Prev::Member),
                     CLASS_BODY | IFACE_BODY | TYPE_BRACE => !matches!(
                         prev,
-                        Prev::Op | Prev::Dot | Prev::TypeCtx | Prev::TypeQual | Prev::TypeofInType
+                        Prev::Op
+                            | Prev::Dot
+                            | Prev::TypeCtx
+                            | Prev::TypeQual
+                            | Prev::TypeQualName
+                            | Prev::TypeofInType
+                            | Prev::Arrow
                     ),
                     ENUM_BODY => !matches!(prev, Prev::Op | Prev::Dot),
                     _ => false,
@@ -768,8 +860,9 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     || (nb == b'!' && nb2 == b':');
                 let mut class = PLAIN;
                 let mut new_prev = Prev::Value;
+                let mut unique_end = 0;
                 // `x is T` / `this is T`: `is` is consumed here and a type follows.
-                let is_pred = matches!(prev, Prev::TypeCtx | Prev::TypeQual)
+                let is_pred = matches!(prev, Prev::TypeCtx | Prev::TypeQual | Prev::TypeofInType)
                     && id != b"is"
                     && src[after..].starts_with(b"is")
                     && !is_ident_cont(at(src, after + 2));
@@ -812,9 +905,13 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     && matches!(inner, TYPE_PAREN | TYPE_BRACKET)
                     && (nb == b':' || (nb == b'?' && nb2 == b':'))
                     && w != Word::This
+                    && matches!(
+                        src[..i].trim_ascii_end().last(),
+                        Some(b'(' | b',' | b'.' | b'[')
+                    )
                 {
                     // Function type parameter or tuple label, even when spelled as a keyword.
-                    class = by_convention(id, PLAIN);
+                    class = by_convention(id, if id == b"require" { FUNCTION } else { PLAIN });
                 } else if member_pos
                     && (matches!(w, Word::Ident | Word::Predefined) || name_follows)
                 {
@@ -829,7 +926,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                                     PROPERTY
                                 }
                             } else {
-                                by_convention(id, PLAIN)
+                                constant_only(id)
                             }
                         }
                         CLASS_BODY => {
@@ -856,9 +953,14 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                             }
                         }
                         Word::This => {
-                            class = KEYWORD;
-                            if prev == Prev::TypeCtx {
+                            if prev == Prev::TypeCtx
+                                && !(nb == b':' || (nb == b'?' && nb2 == b':'))
+                                && !is_pred_follows(src, after)
+                            {
+                                // The `this` type is not captured.
                                 new_prev = Prev::Type;
+                            } else {
+                                class = KEYWORD;
                             }
                         }
                         Word::Strict => {
@@ -907,10 +1009,12 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                                 }
                                 b"extends" => {
                                     if iface_header && pending[depth & 63] == IFACE_BODY
-                                        || matches!(prev, Prev::Type | Prev::TypeCtx)
+                                        || prev == Prev::TypeCtx
+                                        || prev.type_end()
                                         || matches!(inner, GENERIC | GENERIC_PARAMS | GENERIC_FN)
                                     {
                                         new_prev = Prev::TypeCtx;
+                                        ext[depth & 63] = ext[depth & 63].saturating_add(1);
                                     }
                                 }
                                 b"typeof" if prev == Prev::TypeCtx => new_prev = Prev::TypeofInType,
@@ -950,7 +1054,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                                     b"of" => prev == Prev::Value && inner == PAREN,
                                     b"target" => false,
                                     b"keyof" => prev == Prev::TypeCtx,
-                                    b"readonly" if prev == Prev::TypeCtx => true,
+                                    b"readonly" | b"abstract" if prev == Prev::TypeCtx => true,
                                     b"implements" => iface_header,
                                     b"type" => {
                                         is_ident_start(nb)
@@ -983,7 +1087,9 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                                         Prev::DeclKw
                                     }
                                     b"namespace" => Prev::DeclKw,
-                                    b"readonly" if prev == Prev::TypeCtx => Prev::TypeCtx,
+                                    b"readonly" | b"abstract" if prev == Prev::TypeCtx => {
+                                        Prev::TypeCtx
+                                    }
                                     b"async" if member_pos => Prev::Member,
                                     b"async" | b"from" => Prev::Op,
                                     _ => Prev::Member,
@@ -1019,17 +1125,31 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                                 generic_call
                             };
                         class = match prev {
+                            Prev::TypeQual if nb == b'.' => {
+                                new_prev = Prev::TypeQualName;
+                                PROPERTY
+                            }
                             Prev::TypeCtx if nb == b'.' => {
-                                new_prev = Prev::TypeQual;
+                                new_prev = Prev::TypeQualName;
                                 by_convention(id, PLAIN)
                             }
                             Prev::TypeCtx | Prev::TypeQual => {
                                 if is_pred {
                                     new_prev = Prev::Value;
                                     PLAIN
-                                } else if matches!(id, b"infer" | b"unique" | b"asserts" | b"is")
-                                    && is_ident_start(nb)
+                                } else if id == b"unique"
+                                    && src[after..].starts_with(b"symbol")
+                                    && !is_ident_cont(at(src, after + 6))
                                 {
+                                    // `unique symbol` is one predefined type, space included.
+                                    out[i..after + 6].fill(TYPE);
+                                    new_prev = Prev::Type;
+                                    unique_end = after + 6;
+                                    TYPE
+                                } else if id == b"asserts" && is_ident_start(nb) {
+                                    new_prev = Prev::TypeofInType;
+                                    PLAIN
+                                } else if matches!(id, b"infer" | b"is") && is_ident_start(nb) {
                                     new_prev = Prev::TypeCtx;
                                     PLAIN
                                 } else {
@@ -1081,6 +1201,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                             ),
                             _ if nb == b'='
                                 && !matches!(nb2, b'=' | b'>')
+                                && inner != PAREN
                                 && is_function_value(src, after + 1) =>
                             {
                                 by_convention(id, FUNCTION)
@@ -1101,6 +1222,8 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                 if is_pred {
                     prev = Prev::TypeCtx;
                     i = after + 2;
+                } else if unique_end > i {
+                    i = unique_end;
                 }
             }
             b'(' => {
@@ -1124,7 +1247,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
             }
             b'[' => {
                 let inner = innermost!();
-                let kind = if matches!(prev, Prev::TypeCtx | Prev::Type) {
+                let kind = if prev == Prev::TypeCtx || prev.type_end() {
                     TYPE_BRACKET
                 } else if matches!(inner, CLASS_BODY | IFACE_BODY | TYPE_BRACE)
                     && !matches!(prev, Prev::Op | Prev::Dot)
@@ -1150,7 +1273,8 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     waiting
                 } else if prev == Prev::TypeCtx
                     && !(innermost!() == TYPE_PAREN
-                        && matches!(src[..i].trim_ascii_end().last(), Some(b'(' | b',')))
+                        && matches!(src[..i].trim_ascii_end().last(), Some(b'(' | b','))
+                        && pattern_param(src, i))
                 {
                     TYPE_BRACE
                 } else if matches!(prev, Prev::Op | Prev::FieldStart | Prev::Binding)
@@ -1207,7 +1331,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                 }
             }
             b'<' => {
-                let inner_type = matches!(prev, Prev::TypeCtx | Prev::Type);
+                let inner_type = prev == Prev::TypeCtx || prev.type_end();
                 if at(src, i + 1) == b'<' || (at(src, i + 1) == b'=' && !inner_type) {
                     let len = if at(src, i + 2) == b'=' { 3 } else { 2 };
                     out[i..i + len].fill(PUNCT);
@@ -1221,6 +1345,10 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     generic_call = false;
                     push!(GENERIC_CALL);
                     prev = Prev::TypeCtx;
+                } else if iface_header && prev == Prev::Value && generic_end(src, i - 1).is_some() {
+                    // `class A extends Base<T>`
+                    push!(GENERIC);
+                    prev = Prev::TypeCtx;
                 } else if inner_type {
                     push!(if prev == Prev::Type {
                         GENERIC
@@ -1228,7 +1356,10 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                         GENERIC_FN
                     });
                     prev = Prev::TypeCtx;
-                } else if matches!(prev, Prev::TypeName | Prev::Op | Prev::Stmt | Prev::Binding) {
+                } else if matches!(
+                    prev,
+                    Prev::TypeName | Prev::Op | Prev::Stmt | Prev::Arrow | Prev::Binding
+                ) {
                     push!(GENERIC_PARAMS);
                     prev = Prev::TypeCtx;
                 } else {
@@ -1268,7 +1399,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     prev = if prev == Prev::TypeParenClose {
                         Prev::TypeCtx
                     } else {
-                        Prev::Stmt
+                        Prev::Arrow
                     };
                     continue;
                 }
@@ -1358,7 +1489,11 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                         // Optional parameter or member.
                     } else {
                         let d = depth & 63;
-                        let ty = matches!(prev, Prev::Type | Prev::TypeCtx);
+                        // A conditional type's `?` answers an `extends`; any other is a ternary.
+                        let ty = prev.type_end() && ext[d] > 0;
+                        if ty {
+                            ext[d] -= 1;
+                        }
                         tern[d] = tern[d].saturating_add(1);
                         tern_type[d] = (tern_type[d] << 1) | ty as u32;
                         prev = if ty { Prev::TypeCtx } else { Prev::Op };
@@ -1379,6 +1514,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     // Postfix non-null assertion keeps the value.
                     if !(j == i + 1 && matches!(prev, Prev::Value | Prev::CloseParen)) {
                         prev = Prev::Op;
+                        after_await = true;
                     }
                     i = j;
                 }
@@ -1417,15 +1553,17 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                 if at(src, i + 1) == b'.' && at(src, i + 2) == b'.' {
                     out[i..i + 3].fill(PUNCT);
                     i += 3;
-                    // Spread or rest keeps a field or binding position.
-                    if !matches!(prev, Prev::FieldStart | Prev::Binding | Prev::TypeCtx) {
+                    // Rest keeps a binding or parameter position; a spread is an expression.
+                    if !(matches!(prev, Prev::Binding | Prev::TypeCtx)
+                        || (prev == Prev::FieldStart && innermost!() != OBJECT))
+                    {
                         prev = Prev::Op;
                     }
                 } else {
                     out[i] = PUNCT;
                     i += 1;
-                    prev = if prev == Prev::TypeQual {
-                        Prev::TypeCtx
+                    prev = if prev == Prev::TypeQualName {
+                        Prev::TypeQual
                     } else {
                         Prev::Dot
                     };
@@ -1437,7 +1575,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     j += 1;
                 }
                 out[i..j].fill(PUNCT);
-                prev = if j == i + 1 && matches!(prev, Prev::Type | Prev::TypeCtx) {
+                prev = if j == i + 1 && (prev == Prev::TypeCtx || prev.type_end()) {
                     Prev::TypeCtx
                 } else {
                     Prev::Op
@@ -1539,7 +1677,8 @@ mod tests {
                 "number:type",
                 "y:property",
                 "z:function",
-                "/re/g:string",
+                "re:string",
+                "g:string",
             ]
         );
     }
