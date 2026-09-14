@@ -189,8 +189,11 @@ Measurements (2026-09-14, MacBook Pro):
 Progress:
 - [x] lex module + Rust lexer
 - [x] oracle harness, fixture, direct test, benchmark
-- [ ] renderer + theme colors: lex on the loader thread next to the diff, store classes
-      with `FileData`, look up color by class in `draw_line`
+- [x] renderer + theme colors: `load_pair` lexes both sides by `entry.rel`'s extension
+      (scoped thread next to the diff above 256 KB), classes live in `FileData.classes`,
+      `draw_line` indexes `Theme.syntax` per glyph. sui-protocol-config `lib.rs` (273 KB):
+      lex 0.35 ms per side; `--bench-scroll 600` 0.33-0.36 ms/frame on both main and the
+      branch (no measurable difference).
 - [ ] lexers listed as TODOs in `src/lex/mod.rs`: C, C++, Go, Python, JavaScript,
       TypeScript, Java, C#, Swift, Shell (+ Move)
 
@@ -198,6 +201,6 @@ Progress:
 
 - Borderless window with custom title bar (~22 ms faster cold start; not needed for the 200 ms target)
 - Folding long unchanged regions
-- Syntax highlighting (tree-sitter would hurt cold start; a lexer-based approach fits)
+- Syntax highlighting for more languages (see TODOs in `src/lex/mod.rs`)
 - Optional CoreText rasterizer for pixel-identical Terminal.app text
 - Mouse: click to place cursor, drag scrollbar
