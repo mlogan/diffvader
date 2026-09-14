@@ -89,6 +89,33 @@ impl Lang {
     }
 }
 
+/// `DIFFVADER_LEX_BENCH=file cargo test --release lex_bench -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn lex_bench() {
+    let path = std::env::var("DIFFVADER_LEX_BENCH").expect("DIFFVADER_LEX_BENCH");
+    let src = std::fs::read(&path).unwrap();
+    let lang = Lang::from_path(&path).unwrap();
+    let mut out = vec![0u8; src.len()];
+    let iters = 20;
+    let mut best = f64::MAX;
+    for _ in 0..iters {
+        out.fill(0);
+        let t = std::time::Instant::now();
+        match lang {
+            Lang::Rust => rust::lex(&src, &mut out),
+        }
+        best = best.min(t.elapsed().as_secs_f64());
+    }
+    println!(
+        "{} bytes: best {:.2} ms, {:.0} MB/s, {:.2} ns/byte",
+        src.len(),
+        best * 1e3,
+        src.len() as f64 / 1e6 / best,
+        best * 1e9 / src.len() as f64
+    );
+}
+
 /// Classifies every byte of `src`. The result has exactly `src.len()` entries.
 pub fn lex(lang: Lang, src: &[u8]) -> Vec<u8> {
     let _s = crate::trace::span_arg("lex", src.len() as u64);

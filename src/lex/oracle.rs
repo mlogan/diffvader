@@ -9,6 +9,7 @@
 //! - Operator characters are always `Punct` (the queries capture only some of them, and
 //!   `<`/`>` only in generics).
 //! - Loop labels are colored like lifetimes (tree-sitter-rust captures only lifetimes).
+//! - Shebang lines are comments.
 //! - Macro arguments are unparsed token trees to tree-sitter; the oracle re-highlights
 //!   each invocation's token tree as an expression list so the lexer is checked there too.
 //! - Newline bytes are never compared (they are never drawn).
@@ -30,6 +31,9 @@ const PLAIN: u8 = Class::Plain as u8;
 const ATTRIBUTE: u8 = Class::Attribute as u8;
 const LIFETIME: u8 = Class::Lifetime as u8;
 const PUNCT: u8 = Class::Punct as u8;
+/// Oracle-only marker for bytes with no truth available (macro bodies that parse in no
+/// form, such as `json!` or `quote!` with interpolations); `compare` skips them.
+pub const UNKNOWN: u8 = 255;
 
 /// Maps a tree-sitter capture name onto our class set.
 fn class_for_capture(name: &str) -> Class {
@@ -125,6 +129,11 @@ impl Oracle {
     pub fn classify(&self, src: &[u8]) -> Vec<u8> {
         let mut out = vec![PLAIN; src.len()];
         self.highlight_into(src, &mut out);
+        // A shebang line is uncaptured; it is colored as a comment.
+        if src.starts_with(b"#!") && src.get(2) != Some(&b'[') {
+            let end = memchr::memchr(b'\n', src).unwrap_or(src.len());
+            out[..end].fill(Class::Comment as u8);
+        }
         for i in 0..src.len() {
             if (out[i] == PLAIN || out[i] == ATTRIBUTE) && is_operator_char(src[i]) {
                 out[i] = PUNCT;
@@ -172,9 +181,10 @@ impl Oracle {
     }
 
     /// Re-highlights the contents of every macro invocation's token tree. The body is
-    /// tried as items (`thread_local! { static .. }`), as a parenthesized expression list
-    /// (`println!(..)`, `vec![..]`) and as `match scrutinee { pattern => () }`
-    /// (`matches!`); the first that parses without errors wins, else the expression form.
+    /// tried as a parenthesized expression list (`println!(..)`, `vec![..]`), as items
+    /// (`thread_local! { static .. }`), as `match scrutinee { pattern => () }`
+    /// (`matches!`) and, in pattern position, as a `let` pattern; the first that parses
+    /// without errors wins, and bodies that parse in no form are marked `UNKNOWN`.
     /// Nested invocations are handled by the recursion in `highlight_into`. Macros named
     /// by a path (`wgpu::vertex_attr_array!`) are not captured by the query; the name and
     /// `!` are marked here.
@@ -199,11 +209,20 @@ impl Oracle {
             // byte range of `inner` copied verbatim, so classes map back by offset.
             let expr = Snippet::new(b"fn _(){(", vec![(0, inner.len())], b")}");
             let items = Snippet::new(b"", vec![(0, inner.len())], b"");
-            let mut candidates = vec![items, expr.clone()];
+            let mut candidates = vec![expr, items];
             if let Some(c) = top_level_comma(inner) {
+                // A trailing comma is not part of the pattern.
+                let mut pat_end = inner.len();
+                while pat_end > c + 1 && matches!(inner[pat_end - 1], b' ' | b'\n' | b'\t' | b'\r')
+                {
+                    pat_end -= 1;
+                }
+                if pat_end > c + 1 && inner[pat_end - 1] == b',' {
+                    pat_end -= 1;
+                }
                 let as_match = Snippet::new(
                     b"fn _(){match (",
-                    vec![(0, c), (c + 1, inner.len())],
+                    vec![(0, c), (c + 1, pat_end)],
                     b" => ()}}",
                 )
                 .with_glue(b") {");
@@ -213,18 +232,33 @@ impl Oracle {
                     candidates.push(as_match);
                 }
             }
+            if inv.in_pattern {
+                let as_pattern = Snippet::new(b"fn _(){let (", vec![(0, inner.len())], b") = 0;}");
+                candidates.insert(0, as_pattern);
+            }
             let mut chosen = None;
-            for cand in &candidates {
+            for (k, cand) in candidates.iter().enumerate() {
                 let bytes = cand.build(inner);
                 let Some(t) = parser.parse(&bytes, None) else {
                     continue;
                 };
+                if std::env::var_os("DIFFVADER_LEX_DEBUG").is_some() {
+                    eprintln!(
+                        "candidate {k} error={}: {}\n{}",
+                        t.root_node().has_error(),
+                        String::from_utf8_lossy(&bytes),
+                        t.root_node().to_sexp()
+                    );
+                }
                 if !t.root_node().has_error() {
                     chosen = Some(cand.clone());
                     break;
                 }
             }
-            let cand = chosen.unwrap_or(expr);
+            let Some(cand) = chosen else {
+                out[start + 1..end - 1].fill(UNKNOWN);
+                continue;
+            };
             let bytes = cand.build(inner);
             let mut sub = vec![PLAIN; bytes.len()];
             self.highlight_into(&bytes, &mut sub);
@@ -309,6 +343,8 @@ fn top_level_comma(src: &[u8]) -> Option<usize> {
 struct Invocation {
     /// Byte range of the macro name (a path for `a::b!`).
     name: (usize, usize),
+    /// The invocation is a pattern (`sp!(loc, Pat(x)) => ..`).
+    in_pattern: bool,
     token_tree: (usize, usize),
     /// Range of the name segment plus `!` when the macro is named by a path.
     scoped_name: Option<(usize, usize)>,
@@ -335,8 +371,22 @@ fn collect_macro_invocations(node: Node, out: &mut Vec<Invocation>) {
             }
         }
         if let Some(token_tree) = token_tree {
+            let in_pattern = node.parent().is_some_and(|p| match p.kind() {
+                "let_declaration" | "let_condition" => {
+                    p.child_by_field_name("pattern").is_some_and(|c| c == node)
+                }
+                "match_pattern"
+                | "tuple_pattern"
+                | "tuple_struct_pattern"
+                | "or_pattern"
+                | "ref_pattern"
+                | "slice_pattern"
+                | "field_pattern" => true,
+                _ => false,
+            });
             out.push(Invocation {
                 name,
+                in_pattern,
                 token_tree,
                 scoped_name,
             });
@@ -363,7 +413,7 @@ pub fn compare(src: &[u8], ours: &[u8], oracle: &[u8]) -> Vec<Mismatch> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < ours.len() {
-        if ours[i] == oracle[i] || src[i] == b'\n' {
+        if ours[i] == oracle[i] || src[i] == b'\n' || oracle[i] == UNKNOWN {
             i += 1;
             continue;
         }
@@ -401,6 +451,7 @@ struct Report {
     files: usize,
     bytes: usize,
     mismatched: usize,
+    unverified: usize,
     runs: usize,
     by_pair: BTreeMap<(Class, Class), usize>,
     lex_time: f64,
@@ -415,6 +466,7 @@ fn check_file(path: &Path, oracle: &Oracle, show: usize, report: &mut Report) {
     let mismatches = compare(&src, &ours, &truth);
     report.files += 1;
     report.bytes += src.len();
+    report.unverified += truth.iter().filter(|&&c| c == UNKNOWN).count();
     report.runs += mismatches.len();
     for m in &mismatches {
         report.mismatched += m.end - m.start;
@@ -465,9 +517,10 @@ fn run_corpus(root: &Path) -> Report {
     let mut pairs: Vec<_> = report.by_pair.iter().collect();
     pairs.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
     println!(
-        "\n{} files, {} bytes, {} mismatched bytes in {} runs ({:.4}%); lexing {:.1} MB/s",
+        "\n{} files, {} bytes ({} unverifiable), {} mismatched bytes in {} runs ({:.4}%); lexing {:.1} MB/s",
         report.files,
         report.bytes,
+        report.unverified,
         report.mismatched,
         report.runs,
         100.0 * report.mismatched as f64 / report.bytes.max(1) as f64,
