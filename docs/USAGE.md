@@ -149,6 +149,8 @@ directory and its path is printed on exit, in case the clipboard gets overwritte
   but keep a faint gutter marker so the hidden difference is still discoverable.
 - The current change is marked with a bright bar in both gutters.
 - The scrollbar on the right shows every change as a red / green / blue tick.
+- Text is syntax highlighted for Rust (`.rs`) files; other files are drawn in one color.
+  The language comes from the file extension.
 
 ## Performance notes
 
@@ -158,6 +160,8 @@ Measured on an M-series Mac Studio, release build, `--timing`:
   A 2.2 MB / 80k-line C file pair with 110k changed lines diffs in ~27 ms; typical source
   files take 1-3 ms. This work fully overlaps AppKit startup. `git dv` with 341 changed
   files reaches its first frame in the same ~150 ms as a two-file diff.
+- Syntax highlighting is a single linear lexer pass per file on the same thread
+  (~1.5 ns/byte: 0.35 ms for a 270 KB Rust file) and adds nothing measurable per frame.
 - `git difftool` is inherently slower because git does work before the tool starts:
   ~150 ms per file of shell-helper work (six or seven `git config` subprocesses per file,
   one more when `-t` is not given) of which diffvader's own invocation is ~10 ms, or 250-400
