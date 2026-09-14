@@ -149,6 +149,33 @@ Follow-ups the same day:
   dependency. Fonts may be family names: `font::resolve` scans the font directories (~2 ms
   on the font thread, only when a name is configured). `--init-config` writes a template.
 
+## Syntax highlighting (2026-09-14)
+
+Branch `mlogan-syntax-highlighting`. Hand-written lexers, no runtime dependencies.
+
+Design:
+- `src/lex/mod.rs`: `Class` (u8 per byte: Plain, Comment, String, Number, Keyword, Type,
+  Function, Attribute, Lifetime, Property, Constant, Punct, Operator, ...), `Lang` chosen by
+  file extension, `lex(lang, src, out)`.
+- `src/lex/rust.rs`: single linear pass over the file bytes writing one class byte per
+  input byte into a preallocated buffer (`out[start..end].fill(class)`; Plain is 0 so
+  untouched bytes need no write). No tokens, no allocations inside the loop, one-token
+  lookbehind for the contextual cases tree-sitter distinguishes (`fn name`, `.field`,
+  `.method(`, `path::func(`, `name!`).
+- Lexing runs on the loader thread next to the diff and is stored with the `FileData`, so
+  the renderer only indexes `classes[byte]` while drawing a line.
+- Oracle test (`src/lex/oracle.rs`, `#[cfg(test)]`): tree-sitter + tree-sitter-highlight
+  (dev-dependencies only) highlight the same bytes; captures are mapped onto `Class` and
+  the two per-byte arrays are compared, reporting `file:line:col ours/oracle «text»`.
+  The default corpus is this repo's `src/*.rs`; `DIFFVADER_LEX_CORPUS=dir` runs over any
+  tree and prints mismatch statistics (`cargo test lex_oracle -- --nocapture`).
+
+Progress:
+- [ ] lex module + Rust lexer
+- [ ] oracle harness
+- [ ] renderer + theme colors
+- [ ] TODO lexers: C/C++, Go, Python, JavaScript/TypeScript, Java, Swift, Move, Shell, Markdown/TOML/YAML
+
 ## Remaining / ideas
 
 - Borderless window with custom title bar (~22 ms faster cold start; not needed for the 200 ms target)
