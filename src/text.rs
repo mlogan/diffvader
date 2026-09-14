@@ -27,6 +27,9 @@ pub struct FileData {
     /// Files larger than 4 GiB are rejected at load so `u32` offsets are exact.
     starts: Vec<u32>,
     pub binary: bool,
+    /// Highlight class per byte (`lex::Class` values), or empty when the language has no
+    /// lexer.
+    pub classes: Vec<u8>,
 }
 
 /// Files at or below this size are read into memory; larger ones are mapped. Reading small
@@ -77,6 +80,7 @@ impl FileData {
             bytes,
             starts,
             binary,
+            classes: Vec::new(),
         }
     }
 
@@ -97,6 +101,15 @@ impl FileData {
             end -= 1;
         }
         &self.bytes[start..end]
+    }
+
+    /// Classes for the bytes of `line(i)`: the same length, or empty without highlighting.
+    pub fn line_classes(&self, i: usize) -> &[u8] {
+        if self.classes.is_empty() {
+            return &[];
+        }
+        let start = self.starts[i] as usize;
+        &self.classes[start..start + self.line(i).len()]
     }
 
     pub fn lines(&self) -> impl Iterator<Item = &[u8]> + '_ {

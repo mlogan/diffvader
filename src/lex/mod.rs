@@ -43,6 +43,7 @@ pub enum Class {
 pub const CLASS_COUNT: usize = Class::Punct as usize + 1;
 
 impl Class {
+    #[cfg(test)]
     const ALL: [Class; CLASS_COUNT] = [
         Class::Plain,
         Class::Comment,
@@ -59,10 +60,12 @@ impl Class {
         Class::Punct,
     ];
 
+    #[cfg(test)]
     pub fn from_u8(b: u8) -> Class {
         Self::ALL.get(b as usize).copied().unwrap_or(Class::Plain)
     }
 
+    #[cfg(test)]
     pub fn name(self) -> &'static str {
         match self {
             Class::Plain => "plain",

@@ -11,8 +11,6 @@ mod git;
 mod gpu;
 mod icon;
 mod keys;
-// Not wired into the renderer yet.
-#[allow(dead_code)]
 mod lex;
 mod text;
 mod theme;
@@ -271,12 +269,28 @@ fn load_pair(
             }
         }
     };
-    let a = load(&entry.left)?;
-    let b = load(&entry.right)?;
+    let mut a = load(&entry.left)?;
+    let mut b = load(&entry.right)?;
     if a.binary || b.binary {
         return Err("binary files differ".to_string());
     }
-    let d = diff::diff_files(&a, &b, mode);
+    let lang = lex::Lang::from_path(&entry.rel);
+    let lex_both = |a: &FileData, b: &FileData| match lang {
+        Some(lang) => (lex::lex(lang, &a.bytes), lex::lex(lang, &b.bytes)),
+        None => (Vec::new(), Vec::new()),
+    };
+    // Lexing is ~1.5 ns/byte; past a few hundred KB it is worth a thread next to the diff.
+    let (d, (ca, cb)) = if lang.is_some() && a.bytes.len() + b.bytes.len() > 256 << 10 {
+        std::thread::scope(|s| {
+            let lexed = s.spawn(|| lex_both(&a, &b));
+            let d = diff::diff_files(&a, &b, mode);
+            (d, lexed.join().expect("lexer thread"))
+        })
+    } else {
+        (diff::diff_files(&a, &b, mode), lex_both(&a, &b))
+    };
+    a.classes = ca;
+    b.classes = cb;
     Ok(Loaded {
         left: Arc::new(a),
         right: Arc::new(b),

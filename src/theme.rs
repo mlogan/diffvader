@@ -1,6 +1,8 @@
 //! Color palettes. Colors are packed RGBA8 (little-endian: r in the low byte) so they can
 //! be handed to the GPU untouched.
 
+use crate::lex::{Class, CLASS_COUNT};
+
 pub type Color = u32;
 
 pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
@@ -55,6 +57,41 @@ pub struct Theme {
     pub picker_match: Color,
     pub status_added: Color,
     pub status_deleted: Color,
+    /// Text color per `lex::Class`; `Plain` is `fg`.
+    pub syntax: [Color; CLASS_COUNT],
+}
+
+struct Syntax {
+    fg: Color,
+    comment: Color,
+    string: Color,
+    escape: Color,
+    number: Color,
+    keyword: Color,
+    ty: Color,
+    function: Color,
+    attribute: Color,
+    lifetime: Color,
+    property: Color,
+    constant: Color,
+    punct: Color,
+}
+
+const fn syntax(c: Syntax) -> [Color; CLASS_COUNT] {
+    let mut t = [c.fg; CLASS_COUNT];
+    t[Class::Comment as usize] = c.comment;
+    t[Class::String as usize] = c.string;
+    t[Class::Escape as usize] = c.escape;
+    t[Class::Number as usize] = c.number;
+    t[Class::Keyword as usize] = c.keyword;
+    t[Class::Type as usize] = c.ty;
+    t[Class::Function as usize] = c.function;
+    t[Class::Attribute as usize] = c.attribute;
+    t[Class::Lifetime as usize] = c.lifetime;
+    t[Class::Property as usize] = c.property;
+    t[Class::Constant as usize] = c.constant;
+    t[Class::Punct as usize] = c.punct;
+    t
 }
 
 pub const DARK: Theme = Theme {
@@ -91,6 +128,21 @@ pub const DARK: Theme = Theme {
     picker_match: rgb(0xf0, 0xc0, 0x60),
     status_added: rgb(0x5f, 0xd0, 0x90),
     status_deleted: rgb(0xf0, 0x70, 0x78),
+    syntax: syntax(Syntax {
+        fg: rgb(0xd4, 0xd8, 0xe0),
+        comment: rgb(0x7a, 0x82, 0x92),
+        string: rgb(0xa8, 0xcc, 0x8c),
+        escape: rgb(0x78, 0xcc, 0xc8),
+        number: rgb(0xe3, 0xa5, 0x6f),
+        keyword: rgb(0xc5, 0x95, 0xe8),
+        ty: rgb(0xe8, 0xc6, 0x7e),
+        function: rgb(0x80, 0xb6, 0xf2),
+        attribute: rgb(0x8e, 0xa8, 0xa0),
+        lifetime: rgb(0xe8, 0x96, 0x8a),
+        property: rgb(0xa6, 0xc8, 0xda),
+        constant: rgb(0xe3, 0xa5, 0x6f),
+        punct: rgb(0x9a, 0xa2, 0xb0),
+    }),
 };
 
 pub const LIGHT: Theme = Theme {
@@ -127,4 +179,19 @@ pub const LIGHT: Theme = Theme {
     picker_match: rgb(0xb0, 0x60, 0x00),
     status_added: rgb(0x20, 0x90, 0x50),
     status_deleted: rgb(0xc0, 0x30, 0x40),
+    syntax: syntax(Syntax {
+        fg: rgb(0x24, 0x28, 0x30),
+        comment: rgb(0x78, 0x7e, 0x8a),
+        string: rgb(0x3a, 0x7a, 0x2a),
+        escape: rgb(0x12, 0x7a, 0x84),
+        number: rgb(0xa4, 0x52, 0x08),
+        keyword: rgb(0x86, 0x38, 0xb4),
+        ty: rgb(0x86, 0x5e, 0x00),
+        function: rgb(0x22, 0x5c, 0xb4),
+        attribute: rgb(0x46, 0x70, 0x68),
+        lifetime: rgb(0xac, 0x42, 0x36),
+        property: rgb(0x2a, 0x6a, 0x86),
+        constant: rgb(0xa4, 0x52, 0x08),
+        punct: rgb(0x5a, 0x60, 0x6c),
+    }),
 };

@@ -22,6 +22,7 @@ use crate::font::{Atlas, FontSet};
 use crate::fuzzy;
 use crate::gpu::{DrawList, Gpu, GpuCore, SurfaceProblem};
 use crate::keys::{Action, KeyInput, Vi};
+use crate::lex;
 use crate::text::FileData;
 use crate::theme::{self, Theme};
 use crate::trace;
@@ -2179,6 +2180,9 @@ enum WsShow {
 
 struct LineStyle<'a> {
     fg: u32,
+    /// Class per byte of the line (empty: everything is `fg`) and the color per class.
+    classes: &'a [u8],
+    syntax: &'a [u32; lex::CLASS_COUNT],
     strong: u32,
     ranges: &'a [Range<u32>],
     search: &'a [Range<u32>],
@@ -2257,7 +2261,11 @@ fn draw_line(p: &mut Painter, x: f32, y: f32, bytes: &[u8], st: &LineStyle) {
             } else if (c as u32) < 0x20 || c == '\u{7f}' {
                 p.glyph(cx, y, '\u{2400}', st.ws_color);
             } else {
-                p.glyph(cx, y, c, st.fg);
+                let fg = match st.classes.get(i) {
+                    Some(&k) => st.syntax.get(k as usize).copied().unwrap_or(st.fg),
+                    None => st.fg,
+                };
+                p.glyph(cx, y, c, fg);
             }
         }
         col += cells;
@@ -2517,6 +2525,7 @@ fn build_frame(app: &mut App, lay: &Layout) {
                     }
                     let y = lay.text_top + (idx - first_row) as f32 * line_h - frac;
                     let bytes = file.line(line as usize);
+                    let classes = file.line_classes(line as usize);
                     let (strong, ranges, ws): (u32, &[Range<u32>], WsShow) = match row.kind {
                         RowKind::Equal => (
                             0,
@@ -2587,6 +2596,8 @@ fn build_frame(app: &mut App, lay: &Layout) {
                     };
                     let st = LineStyle {
                         fg: th.fg,
+                        classes,
+                        syntax: &th.syntax,
                         strong,
                         ranges,
                         search: &search_hits,
