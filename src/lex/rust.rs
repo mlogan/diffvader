@@ -922,3 +922,65 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::lex::{lex, Class, Lang};
+
+    /// Non-plain, non-punctuation runs as `text:class`.
+    fn spans(src: &str) -> Vec<String> {
+        let classes = lex(Lang::Rust, src.as_bytes());
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < classes.len() {
+            let c = classes[i];
+            let start = i;
+            while i < classes.len() && classes[i] == c && src.as_bytes()[i] != b' ' {
+                i += 1;
+            }
+            if i == start {
+                i += 1;
+                continue;
+            }
+            let class = Class::from_u8(c);
+            if !matches!(class, Class::Plain | Class::Punct) {
+                out.push(format!("{}:{}", &src[start..i], class.name()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn contextual_identifiers() {
+        assert_eq!(
+            spans("fn f(x: Opt<u8>) -> u8 { x.y.z(Some(1)) }"),
+            [
+                "fn:keyword",
+                "f:function",
+                "Opt:type",
+                "u8:type",
+                "u8:type",
+                "y:property",
+                "z:function",
+                "Some:function",
+                "1:number",
+            ]
+        );
+        assert_eq!(
+            spans("match v { Some(x) => vec![x], _ => 'a' }"),
+            ["match:keyword", "Some:type", "vec!:function", "'a':string"]
+        );
+        assert_eq!(
+            spans("#[derive(Debug)] // c\nlet s = r#\"q\"#;"),
+            [
+                "#:attribute",
+                "derive:attribute",
+                "Debug:type",
+                "//:comment",
+                "c:comment",
+                "let:keyword",
+                "r#\"q\"#:string"
+            ]
+        );
+    }
+}

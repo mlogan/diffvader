@@ -11,6 +11,8 @@ mod git;
 mod gpu;
 mod icon;
 mod keys;
+// Not wired into the renderer yet.
+#[allow(dead_code)]
 mod lex;
 mod text;
 mod theme;

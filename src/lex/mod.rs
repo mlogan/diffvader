@@ -27,30 +27,40 @@ pub enum Class {
     Type,
     /// Function and method names at definitions and calls, and macro names.
     Function,
-    /// Whole attribute (`#[derive(Debug)]`).
+    /// Attribute text (`#[derive(Debug)]`); names and literals inside keep their classes.
     Attribute,
     /// Lifetimes and labels (`'a`, `'outer`).
     Lifetime,
     /// Field names (`x.field`).
     Property,
-    /// `ALL_CAPS` identifiers.
+    /// `ALL_CAPS` identifiers. tree-sitter-rust's rule for these never matches (its regex
+    /// has a stray quote), so the Rust lexer does not emit it.
     Constant,
-    /// Brackets and delimiters: `()[]{}` `,;:` `::` `.`.
+    /// Brackets, delimiters and operators.
     Punct,
-    Operator,
 }
 
-pub const CLASS_COUNT: usize = Class::Operator as usize + 1;
+pub const CLASS_COUNT: usize = Class::Punct as usize + 1;
 
 impl Class {
+    const ALL: [Class; CLASS_COUNT] = [
+        Class::Plain,
+        Class::Comment,
+        Class::String,
+        Class::Escape,
+        Class::Number,
+        Class::Keyword,
+        Class::Type,
+        Class::Function,
+        Class::Attribute,
+        Class::Lifetime,
+        Class::Property,
+        Class::Constant,
+        Class::Punct,
+    ];
+
     pub fn from_u8(b: u8) -> Class {
-        // Safety: the renderer only reads buffers produced by the lexers, which write
-        // `Class` discriminants; a bounds check keeps garbage from becoming UB.
-        if (b as usize) < CLASS_COUNT {
-            unsafe { std::mem::transmute(b) }
-        } else {
-            Class::Plain
-        }
+        Self::ALL.get(b as usize).copied().unwrap_or(Class::Plain)
     }
 
     pub fn name(self) -> &'static str {
@@ -68,7 +78,6 @@ impl Class {
             Class::Property => "property",
             Class::Constant => "constant",
             Class::Punct => "punct",
-            Class::Operator => "operator",
         }
     }
 }
@@ -76,7 +85,22 @@ impl Class {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     Rust,
-    // TODO: C, Cpp, Go, Python, JavaScript, TypeScript, Java, Swift, Move, Shell.
+    // TODO: one lexer per language below, each with its tree-sitter grammar added as a
+    // dev-dependency and wired into `oracle::Oracle::new`, and zero oracle mismatches on a
+    // fixture in `testdata/`:
+    // - C (`.c`, `.h`): tree-sitter-c. Preprocessor lines are the main lexer-level state.
+    // - C++ (`.cc`, `.cpp`, `.hpp`, ...): tree-sitter-cpp. Raw strings `R"delim(..)delim"`.
+    // - Go (`.go`): tree-sitter-go. Backtick raw strings, no nesting comments.
+    // - Python (`.py`): tree-sitter-python. Triple-quoted and prefixed (f/r/b) strings,
+    //   decorators as attributes.
+    // - JavaScript (`.js`, `.mjs`, `.jsx`): tree-sitter-javascript. Template literals with
+    //   `${..}` nesting and the regex-literal-vs-division ambiguity.
+    // - TypeScript (`.ts`, `.tsx`): tree-sitter-typescript. JavaScript plus type positions.
+    // - Java (`.java`): tree-sitter-java. Text blocks, annotations as attributes.
+    // - C# (`.cs`): tree-sitter-c-sharp. Verbatim and interpolated strings.
+    // - Swift (`.swift`): tree-sitter-swift. Nested comments, `#""#` raw strings.
+    // - Shell (`.sh`, `.bash`, `.zsh`): tree-sitter-bash. Heredocs and `$(..)` nesting.
+    // Also wanted here: Move (`.move`), for Sui; its grammar lives outside crates.io.
 }
 
 impl Lang {
