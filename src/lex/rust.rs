@@ -333,7 +333,8 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
     let n = src.len();
     let mut i = 0usize;
     let mut prev = Prev::Other;
-    // Innermost open bracket kinds; beyond the array only the depth is tracked.
+    // Innermost open bracket kinds, indexed by depth modulo 64: nesting deeper than that
+    // aliases outer levels, which can only misclassify, and keeps every index in bounds.
     let mut brackets = [OTHER; 64];
     let mut depth = 0usize;
     // Bit per depth: inside a `match` block, whether the arm's pattern is still open.
@@ -369,7 +370,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
     macro_rules! innermost {
         () => {
             if depth > 0 {
-                brackets[(depth - 1).min(brackets.len() - 1)]
+                brackets[(depth - 1) & 63]
             } else {
                 0
             }
@@ -383,22 +384,18 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
             let mut d = depth;
             while d > 0
                 && matches!(
-                    brackets[(d - 1).min(brackets.len() - 1)],
+                    brackets[(d - 1) & 63],
                     OTHER | BRACE | GENERIC | GENERIC_CTX | TURBOFISH | MACRO_ARGS
                 )
             {
                 d -= 1;
             }
-            let kind = if d > 0 {
-                brackets[(d - 1).min(brackets.len() - 1)]
-            } else {
-                0
-            };
+            let kind = if d > 0 { brackets[(d - 1) & 63] } else { 0 };
             let_pattern
                 || in_closure
                 || kind == PARAMS
                 || (matches!(kind, MATCH_BRACE | MATCH_PAREN)
-                    && pattern_bits >> (d - 1).min(63) & 1 == 1)
+                    && (pattern_bits >> ((d - 1) & 63)) & 1 == 1)
         }};
     }
 
@@ -411,7 +408,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
         let b = src[i];
         match b {
             b' ' | b'\t' | b'\n' | b'\r' => {
-                i += 1;
+                i = skip_ws(src, i + 1);
             }
             b'/' if at(src, i + 1) == b'/' => {
                 let end = memchr::memchr(b'\n', &src[i..]).map_or(n, |k| i + k);
@@ -526,10 +523,6 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                 let plain_name = raw != usize::MAX || i == attr_path_at || metavar;
                 let mut class = if plain_name { PLAIN } else { keyword(id) };
                 let mut new_prev = Prev::Value;
-                let after = skip_ws(src, end);
-                let nb = at(src, after);
-                let path_next = nb == b':' && at(src, after + 1) == b':';
-                let turbofish = path_next && at(src, after + 2) == b'<';
                 let in_tt = i < tt_end;
                 if in_tt && !plain_name {
                     // Token trees know a slightly different keyword set.
@@ -540,6 +533,15 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                         _ => class,
                     };
                 }
+                // The next significant byte; keywords never look past whitespace.
+                let (after, nb) = if class == KEYWORD {
+                    (end, next)
+                } else {
+                    let a = skip_ws(src, end);
+                    (a, at(src, a))
+                };
+                let path_next = nb == b':' && at(src, after + 1) == b':';
+                let turbofish = path_next && at(src, after + 2) == b'<';
                 match class {
                     KEYWORD => {
                         new_prev = Prev::Other;
@@ -547,7 +549,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                             b"fn" if !in_tt => new_prev = Prev::Fn,
                             b"pub" => new_prev = Prev::Pub,
                             b"match" | b"struct" | b"union" | b"enum" if !in_tt => {
-                                pending[depth.min(63)] = match id[0] {
+                                pending[depth & 63] = match id[0] {
                                     b'm' => MATCH_BRACE,
                                     b'e' => ENUM_BRACE,
                                     _ => DECL_BRACE,
@@ -567,7 +569,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                             b"in" => let_pattern = false,
                             // A guard: the arm's pattern is over.
                             b"if" if matches!(innermost!(), MATCH_BRACE | MATCH_PAREN) => {
-                                pattern_bits &= !(1 << (depth - 1).min(63));
+                                pattern_bits &= !(1 << ((depth - 1) & 63));
                             }
                             // `use path;` or `use<'a>` precise capturing.
                             b"use" if nb != b'<' => in_use = true,
@@ -629,7 +631,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                             out[i..=end].fill(FUNCTION);
                             i = end + 1;
                             prev = Prev::Other;
-                            pending[depth.min(63)] = if id.ends_with(b"matches") {
+                            pending[depth & 63] = if id.ends_with(b"matches") {
                                 MATCH_PAREN
                             } else {
                                 MACRO_ARGS
@@ -696,20 +698,20 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                 if prev == Prev::MacroRules {
                     tt_end = tt_end.max(bracket_end(src, i));
                 }
-                let waiting = pending[depth.min(63)];
+                let waiting = pending[depth & 63];
                 item_colon = false;
                 let kind = match b {
                     _ if waiting == MACRO_ARGS => {
-                        pending[depth.min(63)] = 0;
+                        pending[depth & 63] = 0;
                         MACRO_ARGS
                     }
                     // `struct S(u8);`
                     b'(' if waiting == DECL_BRACE => {
-                        pending[depth.min(63)] = 0;
+                        pending[depth & 63] = 0;
                         TYPE_PAREN
                     }
                     b'{' | b'(' if waiting != 0 && (b == b'{') == (waiting != MATCH_PAREN) => {
-                        pending[depth.min(63)] = 0;
+                        pending[depth & 63] = 0;
                         waiting
                     }
                     // `enum E { V { field: T } }`
@@ -723,11 +725,9 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     _ => OTHER,
                 };
                 fn_pending = false;
-                if depth < brackets.len() {
-                    brackets[depth] = kind;
-                }
+                brackets[depth & 63] = kind;
                 if kind == MATCH_BRACE {
-                    pattern_bits |= 1 << depth.min(63);
+                    pattern_bits |= 1 << (depth & 63);
                 }
                 depth += 1;
                 out[i] = PUNCT;
@@ -748,7 +748,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                 depth = depth.saturating_sub(1);
                 if b == b'}' && innermost!() == MATCH_BRACE {
                     // A block-bodied arm ended; the next arm's pattern follows.
-                    pattern_bits |= 1 << (depth - 1).min(63);
+                    pattern_bits |= 1 << ((depth - 1) & 63);
                 }
                 out[i] = PUNCT;
                 i += 1;
@@ -766,7 +766,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
             b',' => {
                 out[i] = PUNCT;
                 if matches!(innermost!(), MATCH_BRACE | MATCH_PAREN) {
-                    pattern_bits |= 1 << (depth - 1).min(63);
+                    pattern_bits |= 1 << ((depth - 1) & 63);
                 }
                 prev = if matches!(innermost!(), GENERIC | GENERIC_CTX | TURBOFISH | TYPE_PAREN) {
                     Prev::TypeCtx
@@ -781,9 +781,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                 i += 2;
                 if at(src, i) == b'<' {
                     out[i] = PUNCT;
-                    if depth < brackets.len() {
-                        brackets[depth] = TURBOFISH;
-                    }
+                    brackets[depth & 63] = TURBOFISH;
                     depth += 1;
                     prev = Prev::TypeCtx;
                     i += 1;
@@ -840,7 +838,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                     out[i + 1] = PUNCT;
                     i += 2;
                     if depth > 0 {
-                        pattern_bits &= !(1 << (depth - 1).min(63));
+                        pattern_bits &= !(1 << ((depth - 1) & 63));
                     }
                     prev = Prev::Other;
                 } else {
@@ -869,8 +867,8 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                 let in_type = (prev == Prev::TypeCtx || (b == b'<' && prev == Prev::Type))
                     && !(b == b'<' && matches!(at(src, i + 1), b'=' | b'<'));
                 if b == b'<' && in_type {
-                    if depth < brackets.len() {
-                        brackets[depth] = if prev == Prev::Type {
+                    {
+                        brackets[depth & 63] = if prev == Prev::Type {
                             GENERIC
                         } else {
                             GENERIC_CTX
@@ -909,7 +907,7 @@ pub fn lex(src: &[u8], out: &mut [u8]) {
                 type_alias = false;
                 item_colon = false;
                 // `struct Unit;` never gets its brace.
-                pending[depth.min(63)] = 0;
+                pending[depth & 63] = 0;
                 i += 1;
             }
             b'+' | b'-' | b'/' | b'%' | b'^' | b'!' | b'?' | b'@' | b'~' | b'$' => {
