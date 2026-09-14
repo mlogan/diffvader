@@ -11,6 +11,7 @@ mod git;
 mod gpu;
 mod icon;
 mod keys;
+mod lex;
 mod text;
 mod theme;
 mod trace;
